@@ -2,8 +2,51 @@ import express from 'express';
 import cors from 'cors';
 import jwt from 'jsonwebtoken';
 import nodemailer from 'nodemailer';
+import fs from 'node:fs';
+import path from 'node:path';
 import { randomBytes, scryptSync, timingSafeEqual } from 'node:crypto';
-import { initializeDatabase, loadCollection, saveCollection } from './db.js';
+import { fileURLToPath } from 'node:url';
+import { getDatabaseDriver, initializeDatabase, loadCollection, saveCollection } from './db.js';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+const loadLocalEnv = () => {
+  const envPath = path.join(__dirname, '.env');
+  if (!fs.existsSync(envPath)) {
+    return;
+  }
+
+  const envLines = fs.readFileSync(envPath, 'utf8').split(/\r?\n/);
+  for (const line of envLines) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) {
+      continue;
+    }
+
+    const separatorIndex = trimmed.indexOf('=');
+    if (separatorIndex === -1) {
+      continue;
+    }
+
+    const key = trimmed.slice(0, separatorIndex).trim();
+    if (!key || process.env[key] !== undefined) {
+      continue;
+    }
+
+    let value = trimmed.slice(separatorIndex + 1).trim();
+    if (
+      (value.startsWith('"') && value.endsWith('"')) ||
+      (value.startsWith("'") && value.endsWith("'"))
+    ) {
+      value = value.slice(1, -1);
+    }
+
+    process.env[key] = value;
+  }
+};
+
+loadLocalEnv();
 
 const app = express();
 const NODE_ENV = process.env.NODE_ENV || 'development';
@@ -22,8 +65,23 @@ const DEFAULT_DEV_PASSWORDS = {
 };
 const PASSWORD_HASH_PREFIX = 'scrypt';
 const MAIL_FROM = process.env.MAIL_FROM || 'MRN System <no-reply@example.com>';
+const DEFAULT_PRODUCTION_FRONTEND_URL = 'https://tase-mrn-frontend.vercel.app';
+const DEFAULT_PRODUCTION_BACKEND_URL = 'https://tase-mrn-backend.onrender.com';
+const FRONTEND_URL = String(
+  process.env.FRONTEND_URL
+  || process.env.APP_FRONTEND_URL
+  || DEFAULT_PRODUCTION_FRONTEND_URL
+).trim().replace(/\/+$/, '');
+const BACKEND_URL = String(
+  process.env.BACKEND_URL
+  || process.env.APP_BACKEND_URL
+  || DEFAULT_PRODUCTION_BACKEND_URL
+).trim().replace(/\/+$/, '');
+const EMAIL_LOGO_PATH = path.resolve(__dirname, '..', 'src', 'assets', 'logo.png');
+const EMAIL_LOGO_CID = 'tase-digital-logo';
 let mailTransporter = null;
 let mailTransporterName = 'console';
+let mailTransporterMode = 'console';
 
 const parseCorsOrigins = () => {
   if (process.env.CORS_ORIGINS) {
@@ -33,39 +91,61 @@ const parseCorsOrigins = () => {
       .filter(Boolean);
   }
 
-  if (!IS_PRODUCTION) {
-    return ['http://localhost:5173', 'http://127.0.0.1:5173'];
-  }
-
-  return [];
+  return [DEFAULT_PRODUCTION_FRONTEND_URL];
 };
 
 const CORS_ORIGINS = parseCorsOrigins();
+
+const enableLocalStreamMailTransport = (reason) => {
+  if (reason) {
+    console.log(reason);
+  }
+
+  mailTransporter = nodemailer.createTransport({
+    streamTransport: true,
+    newline: 'unix',
+    buffer: true,
+  });
+  mailTransporterName = 'stream';
+  mailTransporterMode = 'stream';
+};
 
 const initMailTransporter = async () => {
   const mailHost = process.env.MAIL_HOST;
   const mailPort = Number(process.env.MAIL_PORT || 587);
   const mailUser = process.env.MAIL_USER;
   const mailPass = process.env.MAIL_PASS;
-  const mailSecure = process.env.MAIL_SECURE === 'true' || process.env.MAIL_ENCRYPTION === 'tls';
+  const mailEncryption = String(process.env.MAIL_ENCRYPTION || '').trim().toLowerCase();
+  const mailSecure = process.env.MAIL_SECURE === 'true' || mailEncryption === 'ssl' || mailPort === 465;
+  const mailRequireTLS = mailEncryption === 'tls';
 
   if (mailHost && mailUser && mailPass) {
     mailTransporter = nodemailer.createTransport({
       host: mailHost,
       port: mailPort,
       secure: mailSecure,
+      requireTLS: mailRequireTLS,
       auth: {
         user: mailUser,
         pass: mailPass,
       },
     });
     mailTransporterName = mailHost;
+    mailTransporterMode = 'smtp';
     try {
       await mailTransporter.verify();
       console.log(`SMTP mail transport configured via ${mailHost}`);
     } catch (error) {
       console.error('SMTP mail transport verification failed:', error);
-      mailTransporter = null;
+      if (!IS_PRODUCTION) {
+        enableLocalStreamMailTransport(
+          'Falling back to local stream transport for development. Email content will be written to backend logs.'
+        );
+      } else {
+        mailTransporter = null;
+        mailTransporterName = 'console';
+        mailTransporterMode = 'console';
+      }
     }
     return;
   }
@@ -83,17 +163,14 @@ const initMailTransporter = async () => {
         },
       });
       mailTransporterName = 'Ethereal';
+      mailTransporterMode = 'ethereal';
       console.log('Using Ethereal test email service for development. Email preview URLs will be logged.');
       return;
     } catch (error) {
       console.warn('Failed to initialize Ethereal test mail service:', error);
-      console.log('Falling back to local stream transport for email testing. Emails will be printed to console.');
-      mailTransporter = nodemailer.createTransport({
-        streamTransport: true,
-        newline: 'unix',
-        buffer: true,
-      });
-      mailTransporterName = 'stream';
+      enableLocalStreamMailTransport(
+        'Falling back to local stream transport for email testing. Emails will be printed to backend logs.'
+      );
       return;
     }
   }
@@ -139,7 +216,12 @@ app.get('/healthz', (req, res) => {
 });
 
 app.get('/readyz', (req, res) => {
-  res.json({ status: 'ready', environment: NODE_ENV, mailTransport: mailTransporterName });
+  res.json({
+    status: 'ready',
+    environment: NODE_ENV,
+    mailTransport: mailTransporterName,
+    database: getDatabaseDriver(),
+  });
 });
 
 const seededNotifications = [];
@@ -463,6 +545,117 @@ const buildAvatar = (name) =>
     .slice(0, 2)
     .toUpperCase() || 'NA';
 
+const escapeHtml = (value) =>
+  String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+
+const nl2br = (value) => escapeHtml(value).replace(/\r?\n/g, '<br />');
+
+const getEmailLogoAttachments = () =>
+  fs.existsSync(EMAIL_LOGO_PATH)
+    ? [{
+        filename: 'tase-digital-logo.png',
+        path: EMAIL_LOGO_PATH,
+        cid: EMAIL_LOGO_CID,
+      }]
+    : [];
+
+const buildEmailBrandMark = () =>
+  fs.existsSync(EMAIL_LOGO_PATH)
+    ? `<img src="cid:${EMAIL_LOGO_CID}" alt="TASE Digital logo" width="56" height="56" style="display: block; width: 56px; height: 56px; border-radius: 16px; background-color: rgba(255, 255, 255, 0.14); padding: 6px;" />`
+    : `<div style="width: 56px; height: 56px; border-radius: 16px; background-color: rgba(255, 255, 255, 0.14); color: #ffffff; font-size: 20px; font-weight: 700; line-height: 56px; text-align: center;">TD</div>`;
+
+const buildEmailShell = ({
+  preheader,
+  title,
+  intro,
+  bodyHtml,
+  buttonLabel = 'Access your app',
+  buttonUrl = FRONTEND_URL,
+  footerTitle = 'TASE Digital MRN',
+}) => {
+  const safeTitle = escapeHtml(title);
+  const safeIntro = escapeHtml(intro);
+  const safePreheader = escapeHtml(preheader || intro || title);
+  const safeButtonLabel = escapeHtml(buttonLabel);
+  const safeButtonUrl = escapeHtml(buttonUrl);
+  const safeFooterTitle = escapeHtml(footerTitle);
+  const safeFrontendUrl = escapeHtml(FRONTEND_URL);
+  const safeBackendUrl = escapeHtml(BACKEND_URL);
+  const brandMarkHtml = buildEmailBrandMark();
+
+  return `
+    <!doctype html>
+    <html lang="en">
+      <body style="margin: 0; padding: 0; background-color: #eef4ff; font-family: Arial, sans-serif; color: #0f172a;">
+        <div style="display: none; max-height: 0; overflow: hidden; opacity: 0;">${safePreheader}</div>
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background-color: #eef4ff; padding: 24px 12px;">
+          <tr>
+            <td align="center">
+              <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width: 640px;">
+                <tr>
+                  <td style="padding-bottom: 16px;">
+                    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-radius: 24px; overflow: hidden; background: linear-gradient(135deg, #0f172a 0%, #1d4ed8 100%);">
+                      <tr>
+                        <td style="padding: 28px 32px;">
+                          <table role="presentation" cellpadding="0" cellspacing="0">
+                            <tr>
+                              <td style="vertical-align: middle;">
+                                ${brandMarkHtml}
+                              </td>
+                              <td style="padding-left: 16px; vertical-align: middle;">
+                                <p style="margin: 0; font-size: 12px; line-height: 18px; letter-spacing: 0.24em; text-transform: uppercase; color: rgba(255, 255, 255, 0.72);">TASE Digital</p>
+                                <h1 style="margin: 6px 0 0; font-size: 28px; line-height: 34px; color: #ffffff;">${safeTitle}</h1>
+                              </td>
+                            </tr>
+                          </table>
+                          <p style="margin: 20px 0 0; font-size: 15px; line-height: 24px; color: rgba(255, 255, 255, 0.88);">${safeIntro}</p>
+                        </td>
+                      </tr>
+                    </table>
+                  </td>
+                </tr>
+                <tr>
+                  <td style="background-color: #ffffff; border-radius: 24px; padding: 32px; box-shadow: 0 18px 50px rgba(15, 23, 42, 0.08);">
+                    ${bodyHtml}
+                    <table role="presentation" cellpadding="0" cellspacing="0" style="margin: 28px 0 20px;">
+                      <tr>
+                        <td align="center" bgcolor="#1d4ed8" style="border-radius: 999px;">
+                          <a href="${safeButtonUrl}" style="display: inline-block; padding: 14px 26px; font-size: 15px; font-weight: 700; color: #ffffff; text-decoration: none;">${safeButtonLabel}</a>
+                        </td>
+                      </tr>
+                    </table>
+                    <p style="margin: 0 0 8px; font-size: 13px; line-height: 21px; color: #475569;">If the button does not open, copy this link into your browser:</p>
+                    <p style="margin: 0; font-size: 13px; line-height: 22px; word-break: break-all;">
+                      <a href="${safeButtonUrl}" style="color: #1d4ed8; text-decoration: none;">${safeButtonUrl}</a>
+                    </p>
+                  </td>
+                </tr>
+                <tr>
+                  <td style="padding: 16px 8px 0; text-align: center;">
+                    <p style="margin: 0 0 6px; font-size: 12px; line-height: 18px; color: #64748b;">${safeFooterTitle}</p>
+                    <p style="margin: 0; font-size: 12px; line-height: 18px; color: #94a3b8;">
+                      Portal:
+                      <a href="${safeFrontendUrl}" style="color: #64748b; text-decoration: none;">${safeFrontendUrl}</a>
+                      &nbsp;|&nbsp;
+                      API:
+                      <a href="${safeBackendUrl}" style="color: #64748b; text-decoration: none;">${safeBackendUrl}</a>
+                    </p>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+        </table>
+      </body>
+    </html>
+  `;
+};
+
 const normalizeEmployeeCode = (value) => String(value || '').trim().toUpperCase();
 
 const findUserByEmployeeCode = (employeeCode) =>
@@ -637,19 +830,21 @@ const normalizeMRNs = (items) =>
     };
   });
 
-const hydrateStateFromDatabase = () => {
-  users = loadCollection('users', seededUsers);
-  mrns = loadCollection('mrns', seededMrns);
-  notifications = loadCollection('notifications', seededNotifications);
+const hydrateStateFromDatabase = async () => {
+  users = await loadCollection('users', seededUsers);
+  mrns = await loadCollection('mrns', seededMrns);
+  notifications = await loadCollection('notifications', seededNotifications);
 
   users = Array.isArray(users) ? normalizeStoredUsers(users) : normalizeStoredUsers(seededUsers);
   notifications = Array.isArray(notifications) ? notifications : structuredClone(seededNotifications);
   mrns = Array.isArray(mrns) ? normalizeMRNs(mrns) : normalizeMRNs(seededMrns);
 
   ensurePrimaryAdmin();
-  saveUsers();
-  saveMrns();
-  saveNotifications();
+  await Promise.all([
+    saveUsers(),
+    saveMrns(),
+    saveNotifications(),
+  ]);
 };
 
 const validateRuntimeConfig = () => {
@@ -672,10 +867,78 @@ const validateRuntimeConfig = () => {
   }
 };
 
+const sendMailMessage = async ({ to, subject, text, html, logLabel, attachments = [] }) => {
+  if (!mailTransporter) {
+    console.log(`Mail transport is not configured. ${logLabel} email content:`);
+    console.log(text);
+    return {
+      status: 'logged',
+      transport: mailTransporterName,
+      message: 'Mail transport is not configured. Message content was logged on the backend.',
+      previewUrl: null,
+    };
+  }
+
+  try {
+    const info = await mailTransporter.sendMail({
+      from: MAIL_FROM,
+      to,
+      subject,
+      text,
+      html,
+      attachments,
+    });
+
+    const previewUrl = nodemailer.getTestMessageUrl(info);
+    if (previewUrl) {
+      console.log(`${logLabel} email preview: ${previewUrl}`);
+    }
+
+    if (mailTransporterMode === 'stream' && info?.message) {
+      console.log(`${logLabel} email stream output:\n${String(info.message)}`);
+    }
+
+    console.log(`${logLabel} email handled via ${mailTransporterName} for ${to}`);
+
+    if (previewUrl) {
+      return {
+        status: 'preview',
+        transport: mailTransporterName,
+        message: 'Email was generated in preview mode. Check backend logs for the preview URL.',
+        previewUrl,
+      };
+    }
+
+    if (mailTransporterMode === 'stream') {
+      return {
+        status: 'logged',
+        transport: mailTransporterName,
+        message: 'Email was captured by the local development mail stream and written to backend logs.',
+        previewUrl: null,
+      };
+    }
+
+    return {
+      status: 'sent',
+      transport: mailTransporterName,
+      message: 'Email sent successfully.',
+      previewUrl: null,
+    };
+  } catch (error) {
+    console.error(`Failed to send ${logLabel.toLowerCase()} email:`, error);
+    return {
+      status: 'failed',
+      transport: mailTransporterName,
+      message: error instanceof Error ? error.message : 'Unknown email error',
+      previewUrl: null,
+    };
+  }
+};
+
 const sendWelcomeEmail = async (user, tempPassword) => {
   const text = `Hello ${user.name},
 
-Welcome to the MRN System.
+Welcome to TASE Digital MRN.
 
 Your account has been created successfully. Use the credentials below to sign in:
 
@@ -686,58 +949,65 @@ Registered Email: ${user.email}
 Role: ${user.role}
 Department: ${user.department}
 
-Please sign in using your employee code and temporary password.
+Access your app: ${FRONTEND_URL}
+
+Please sign in using your employee code and temporary password, then update your password after the first login.
 
 Regards,
 MRN System Admin`;
 
-  const html = `
-    <div style="font-family: Arial, sans-serif; color: #0f172a; line-height: 1.6;">
-      <h2 style="margin-bottom: 8px;">Welcome to the MRN System</h2>
-      <p>Hello <strong>${user.name}</strong>,</p>
-      <p>Your account has been created successfully. You can now sign in using your employee code and temporary password.</p>
-      <table style="border-collapse: collapse; margin: 16px 0;">
+  const html = buildEmailShell({
+    preheader: `Your TASE Digital MRN account is ready. Sign in with your employee code and temporary password.`,
+    title: 'Your MRN account is ready',
+    intro: 'A new TASE Digital workspace account has been created for you. Your access details are below.',
+    buttonLabel: 'Access your app',
+    buttonUrl: FRONTEND_URL,
+    bodyHtml: `
+      <p style="margin: 0 0 14px; font-size: 16px; line-height: 26px;">Hello <strong>${escapeHtml(user.name)}</strong>,</p>
+      <p style="margin: 0 0 22px; font-size: 15px; line-height: 24px; color: #334155;">
+        Your account has been activated successfully. Use the credentials below to sign in and start working in the MRN portal.
+      </p>
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin: 0 0 22px; border: 1px solid #dbeafe; border-radius: 20px; background-color: #f8fbff;">
         <tr>
-          <td style="padding: 8px 12px; border: 1px solid #cbd5e1;"><strong>Employee Code</strong></td>
-          <td style="padding: 8px 12px; border: 1px solid #cbd5e1;">${user.employeeCode}</td>
-        </tr>
-        <tr>
-          <td style="padding: 8px 12px; border: 1px solid #cbd5e1;"><strong>Temporary Password</strong></td>
-          <td style="padding: 8px 12px; border: 1px solid #cbd5e1;">${tempPassword}</td>
-        </tr>
-        <tr>
-          <td style="padding: 8px 12px; border: 1px solid #cbd5e1;"><strong>Email</strong></td>
-          <td style="padding: 8px 12px; border: 1px solid #cbd5e1;">${user.email}</td>
-        </tr>
-        <tr>
-          <td style="padding: 8px 12px; border: 1px solid #cbd5e1;"><strong>Role</strong></td>
-          <td style="padding: 8px 12px; border: 1px solid #cbd5e1;">${user.role}</td>
+          <td style="padding: 22px;">
+            <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse: collapse;">
+              <tr>
+                <td style="padding: 0 0 14px; font-size: 12px; line-height: 16px; letter-spacing: 0.08em; text-transform: uppercase; color: #64748b;">Employee Code</td>
+                <td style="padding: 0 0 14px; font-size: 15px; line-height: 20px; font-weight: 700; color: #0f172a;" align="right">${escapeHtml(user.employeeCode)}</td>
+              </tr>
+              <tr>
+                <td style="padding: 14px 0; border-top: 1px solid #dbeafe; font-size: 12px; line-height: 16px; letter-spacing: 0.08em; text-transform: uppercase; color: #64748b;">Temporary Password</td>
+                <td style="padding: 14px 0; border-top: 1px solid #dbeafe; font-size: 15px; line-height: 20px; font-weight: 700; color: #0f172a;" align="right">${escapeHtml(tempPassword)}</td>
+              </tr>
+              <tr>
+                <td style="padding: 14px 0; border-top: 1px solid #dbeafe; font-size: 12px; line-height: 16px; letter-spacing: 0.08em; text-transform: uppercase; color: #64748b;">Email</td>
+                <td style="padding: 14px 0; border-top: 1px solid #dbeafe; font-size: 15px; line-height: 20px; color: #0f172a;" align="right">${escapeHtml(user.email)}</td>
+              </tr>
+              <tr>
+                <td style="padding: 14px 0 0; border-top: 1px solid #dbeafe; font-size: 12px; line-height: 16px; letter-spacing: 0.08em; text-transform: uppercase; color: #64748b;">Role</td>
+                <td style="padding: 14px 0 0; border-top: 1px solid #dbeafe; font-size: 15px; line-height: 20px; color: #0f172a;" align="right">${escapeHtml(user.role)}</td>
+              </tr>
+            </table>
+          </td>
         </tr>
       </table>
-      <p>Please sign in and update your password after your first login.</p>
-      <p>Regards,<br />MRN System Admin</p>
-    </div>
-  `;
-
-  if (!mailTransporter) {
-    console.log('Mail transport is not configured. User onboarding email content:');
-    console.log(text);
-    return;
-  }
-
-  const info = await mailTransporter.sendMail({
-    from: MAIL_FROM,
-    to: user.email,
-    subject: 'Welcome to the MRN System',
-    text,
-    html,
+      <div style="margin: 0 0 22px; padding: 16px 18px; border-radius: 18px; background-color: #0f172a;">
+        <p style="margin: 0; font-size: 13px; line-height: 22px; color: rgba(255, 255, 255, 0.82);">
+          For security, please change your temporary password as soon as you complete your first login.
+        </p>
+      </div>
+      <p style="margin: 0; font-size: 14px; line-height: 22px; color: #475569;">Regards,<br />MRN System Admin</p>
+    `,
   });
 
-  const previewUrl = nodemailer.getTestMessageUrl(info);
-  if (previewUrl) {
-    console.log(`Welcome email preview: ${previewUrl}`);
-  }
-  console.log(`Welcome email sent via ${mailTransporterName} to ${user.email}`);
+  return sendMailMessage({
+    to: user.email,
+    subject: 'Welcome to TASE Digital MRN',
+    text,
+    html,
+    logLabel: 'Welcome',
+    attachments: getEmailLogoAttachments(),
+  });
 };
 
 const sendRequesterContactEmail = async ({ requester, mrn, sender, message }) => {
@@ -750,44 +1020,52 @@ ${message}
 
 Current MRN status: ${mrn.status}
 Department: ${mrn.department}
+Access your app: ${FRONTEND_URL}
 
 Regards,
 MRN System`;
 
-  const html = `
-    <div style="font-family: Arial, sans-serif; color: #0f172a; line-height: 1.6;">
-      <h2 style="margin-bottom: 8px;">Requester Contact Notice</h2>
-      <p>Hello <strong>${requester.name}</strong>,</p>
-      <p>The issuing team requested that you review <strong>${mrn.id}</strong>.</p>
-      <div style="margin: 16px 0; padding: 16px; border: 1px solid #cbd5e1; border-radius: 12px; background: #f8fafc;">
-        <p style="margin: 0 0 8px;"><strong>Message from ${sender.name}</strong></p>
-        <p style="margin: 0;">${message}</p>
+  const html = buildEmailShell({
+    preheader: `${sender.name} asked you to review ${mrn.id}.`,
+    title: `Action needed for ${mrn.id}`,
+    intro: 'The issuing team needs your attention on an MRN request. Review the message below and continue in the app.',
+    buttonLabel: 'Access your app',
+    buttonUrl: FRONTEND_URL,
+    bodyHtml: `
+      <p style="margin: 0 0 14px; font-size: 16px; line-height: 26px;">Hello <strong>${escapeHtml(requester.name)}</strong>,</p>
+      <p style="margin: 0 0 22px; font-size: 15px; line-height: 24px; color: #334155;">
+        <strong>${escapeHtml(sender.name)}</strong> requested that you review <strong>${escapeHtml(mrn.id)}</strong>.
+      </p>
+      <div style="margin: 0 0 22px; padding: 18px 20px; border: 1px solid #dbeafe; border-radius: 20px; background-color: #f8fbff;">
+        <p style="margin: 0 0 10px; font-size: 12px; line-height: 16px; letter-spacing: 0.08em; text-transform: uppercase; color: #64748b;">Message from ${escapeHtml(sender.name)}</p>
+        <p style="margin: 0; font-size: 15px; line-height: 24px; color: #0f172a;">${nl2br(message)}</p>
       </div>
-      <p>Current MRN status: <strong>${mrn.status}</strong></p>
-      <p>Department: <strong>${mrn.department}</strong></p>
-      <p>Regards,<br />MRN System</p>
-    </div>
-  `;
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin: 0 0 22px; border: 1px solid #e2e8f0; border-radius: 18px;">
+        <tr>
+          <td style="padding: 16px 18px; font-size: 14px; line-height: 22px; color: #475569;">
+            <strong style="display: block; color: #0f172a;">Current status</strong>
+            ${escapeHtml(mrn.status)}
+          </td>
+        </tr>
+        <tr>
+          <td style="padding: 0 18px 16px; font-size: 14px; line-height: 22px; color: #475569;">
+            <strong style="display: block; color: #0f172a;">Department</strong>
+            ${escapeHtml(mrn.department)}
+          </td>
+        </tr>
+      </table>
+      <p style="margin: 0; font-size: 14px; line-height: 22px; color: #475569;">Regards,<br />MRN System</p>
+    `,
+  });
 
-  if (!mailTransporter) {
-    console.log('Mail transport is not configured. Requester contact email content:');
-    console.log(text);
-    return;
-  }
-
-  const info = await mailTransporter.sendMail({
-    from: MAIL_FROM,
+  return sendMailMessage({
     to: requester.email,
     subject: `Action requested for ${mrn.id}`,
     text,
     html,
+    logLabel: 'Requester contact',
+    attachments: getEmailLogoAttachments(),
   });
-
-  const previewUrl = nodemailer.getTestMessageUrl(info);
-  if (previewUrl) {
-    console.log(`Requester contact email preview: ${previewUrl}`);
-  }
-  console.log(`Requester contact email sent via ${mailTransporterName} to ${requester.email}`);
 };
 
 app.post('/api/auth/login', (req, res) => {
@@ -1208,19 +1486,18 @@ app.post('/api/mrns/:id/contact-requester', authenticate, authorize(['Issuer', '
     mrnId: mrn.id,
   });
 
-  try {
-    await sendRequesterContactEmail({
-      requester,
-      mrn,
-      sender: sender || { name: senderName },
-      message,
-    });
-  } catch (error) {
-    console.error('Failed to send requester contact email:', error);
-  }
+  const emailDelivery = await sendRequesterContactEmail({
+    requester,
+    mrn,
+    sender: sender || { name: senderName },
+    message,
+  });
 
   saveMrns();
-  return res.json(mrn);
+  return res.json({
+    ...mrn,
+    emailDelivery,
+  });
 });
 
 app.post('/api/mrns/:id/comments', authenticate, (req, res) => {
@@ -1383,8 +1660,8 @@ const listenOnPort = (port) => new Promise((resolve, reject) => {
 });
 
 const startServer = async () => {
-  initializeDatabase();
-  hydrateStateFromDatabase();
+  await initializeDatabase();
+  await hydrateStateFromDatabase();
   validateRuntimeConfig();
   await initMailTransporter();
   let port = Number(process.env.PORT || 4000);
@@ -1394,6 +1671,8 @@ const startServer = async () => {
     try {
       await listenOnPort(port);
       console.log(`MRN backend running on http://localhost:${port}`);
+      console.log(`Database driver: ${getDatabaseDriver()}`);
+      console.log(`Mail transport: ${mailTransporter ? mailTransporterName : 'console'}`);
       if (!process.env.JWT_SECRET && !IS_PRODUCTION) {
         console.log('JWT_SECRET is not set. A temporary runtime secret was generated for this session.');
       }

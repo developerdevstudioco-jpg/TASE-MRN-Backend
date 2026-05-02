@@ -4,7 +4,8 @@ This backend provides the Express API for the MRN frontend.
 
 ## Production-focused changes
 
-- SQLite-backed persistence in `backend/data/mrn.sqlite`
+- PostgreSQL-backed persistence when `DATABASE_URL` is set
+- SQLite fallback for local development when `DATABASE_URL` is not set
 - Passwords stored as salted `scrypt` hashes instead of plaintext
 - Config-driven admin bootstrap and JWT secret handling
 - Configurable CORS allowlist
@@ -33,6 +34,8 @@ This backend provides the Express API for the MRN frontend.
 - `NODE_ENV`
 - `PORT`
 - `JWT_SECRET`
+- `DATABASE_URL`
+- `POSTGRES_SSL_MODE`
 - `ADMIN_EMAIL`
 - `ADMIN_EMPLOYEE_CODE`
 - `ADMIN_PASSWORD`
@@ -47,6 +50,6 @@ This backend provides the Express API for the MRN frontend.
 
 ## Notes
 
-- In production, set `JWT_SECRET`, `ADMIN_PASSWORD`, and `CORS_ORIGINS`.
-- On first run, the SQLite database is seeded with demo data and then persisted across restarts.
-- For long-term production scale, PostgreSQL is still the better target database for this app.
+- In production, set `JWT_SECRET`, `DATABASE_URL`, `ADMIN_PASSWORD`, and `CORS_ORIGINS`.
+- When `DATABASE_URL` is present, the backend persists app state in PostgreSQL.
+- When `DATABASE_URL` is absent, the backend falls back to local SQLite at `backend/data/mrn.sqlite`.
