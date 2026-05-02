@@ -1,15 +1,15 @@
 # TASE Digital MRN Backend
 
-This backend provides a simple Express REST API for the MRN frontend.
+This backend provides the Express API for the MRN frontend.
 
-## Features
+## Production-focused changes
 
-- Demo authentication with JWT
-- Employee code login for users and fixed email login for the primary admin
-- Role-based access control for MRN workflows
-- Nodemailer welcome emails for new users
-- Endpoints for MRNs, users, and auth
-- SQLite-backed persistence seeded for demo use on first run
+- SQLite-backed persistence in `backend/data/mrn.sqlite`
+- Passwords stored as salted `scrypt` hashes instead of plaintext
+- Config-driven admin bootstrap and JWT secret handling
+- Configurable CORS allowlist
+- Health endpoints at `/healthz` and `/readyz`
+- Basic security headers and bounded JSON payload size
 
 ## Setup
 
@@ -20,54 +20,33 @@ This backend provides a simple Express REST API for the MRN frontend.
    npm install
    ```
 
-2. Start the backend
+2. Copy `backend/.env.example` to `.env` and fill the required values
+
+3. Start the backend
 
    ```bash
    npm run dev
    ```
 
-3. The backend will run on `http://localhost:4000`
+## Important environment variables
 
-## Database
-
-- The backend now stores app data in a local SQLite database at `backend/data/mrn.sqlite`
-- On first run, the database is seeded with the same demo users and MRNs that were previously kept in memory
-- To use a different database file path, set `MRN_DB_PATH`
-
-## Environment variables
-
+- `NODE_ENV`
+- `PORT`
 - `JWT_SECRET`
+- `ADMIN_EMAIL`
+- `ADMIN_EMPLOYEE_CODE`
+- `ADMIN_PASSWORD`
+- `CORS_ORIGINS`
+- `MRN_DB_PATH`
 - `MAIL_HOST`
 - `MAIL_PORT`
 - `MAIL_SECURE`
 - `MAIL_USER`
 - `MAIL_PASS`
 - `MAIL_FROM`
-- `MRN_DB_PATH`
-
-If mail variables are configured, the backend sends a welcome email with the user's name, employee code, and temporary password when a new user is created.
-
-## Fixed admin account
-
-- Email: `somaskandhanmj@gmail.com`
-- Password: `Kandhan28@@`
-
-Only one admin account is allowed. The primary admin cannot be duplicated, deactivated, or removed.
-
-## API Endpoints
-
-- `POST /api/auth/login`
-- `GET /api/auth/me`
-- `GET /api/mrns`
-- `GET /api/mrns/:id`
-- `POST /api/mrns`
-- `PUT /api/mrns/:id/status`
-- `GET /api/users`
-- `PUT /api/users/:id`
 
 ## Notes
 
-- This setup uses SQLite because it is the fastest way to add durable local persistence without extra infrastructure.
-- For production, PostgreSQL is the better long-term choice for this app because the data is relational and the workflow will benefit from stronger concurrency handling, backups, and reporting support.
-- Regular users sign in with employee code and password.
-"# TASE-MRN-Backend" 
+- In production, set `JWT_SECRET`, `ADMIN_PASSWORD`, and `CORS_ORIGINS`.
+- On first run, the SQLite database is seeded with demo data and then persisted across restarts.
+- For long-term production scale, PostgreSQL is still the better target database for this app.

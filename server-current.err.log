@@ -1,0 +1,9 @@
+SMTP mail transport verification failed: Error: connect EACCES 192.178.211.109:587
+    at TCPConnectWrap.afterConnect [as oncomplete] (node:net:1645:16) {
+  errno: -4092,
+  code: 'ESOCKET',
+  syscall: 'connect',
+  address: '192.178.211.109',
+  port: 587,
+  command: 'CONN'
+}
