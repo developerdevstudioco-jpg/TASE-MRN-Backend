@@ -5,9 +5,10 @@ import nodemailer from 'nodemailer';
 import dotenv from 'dotenv';
 import fs from 'node:fs';
 import path from 'node:path';
+import { execFileSync } from 'node:child_process';
 import { randomBytes, scryptSync, timingSafeEqual } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import puppeteer from 'puppeteer-core';
+import puppeteer from 'puppeteer';
 import { getDatabaseDriver, initializeDatabase, loadCollection, saveCollection } from './db.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -58,16 +59,69 @@ const BACKEND_URL = String(
   || process.env.APP_BACKEND_URL
   || DEFAULT_PRODUCTION_BACKEND_URL
 ).trim().replace(/\/+$/, '');
-const EMAIL_LOGO_PATH = path.resolve(__dirname, '..', 'src', 'assets', 'logo.png');
+const EMAIL_LOGO_FILENAME = 'logo.png';
+const EMAIL_LOGO_PUBLIC_PATH = '/email-assets/logo.png';
+const EMAIL_LOGO_PATH_CANDIDATES = [
+  process.env.EMAIL_LOGO_PATH
+    ? path.isAbsolute(process.env.EMAIL_LOGO_PATH)
+      ? process.env.EMAIL_LOGO_PATH
+      : path.resolve(__dirname, process.env.EMAIL_LOGO_PATH)
+    : '',
+  path.resolve(__dirname, 'assets', EMAIL_LOGO_FILENAME),
+  path.resolve(__dirname, '..', 'src', 'assets', EMAIL_LOGO_FILENAME),
+].filter(Boolean);
 const EMAIL_LOGO_CID = 'tase-digital-logo';
-const PUPPETEER_EXECUTABLE_CANDIDATES = [
+const EMAIL_LOGO_URL = String(process.env.EMAIL_LOGO_URL || '').trim();
+const PUPPETEER_ENV_EXECUTABLE_CANDIDATES = [
   process.env.PUPPETEER_EXECUTABLE_PATH,
   process.env.CHROME_BIN,
+].filter(Boolean);
+const WINDOWS_BROWSER_PATH_CANDIDATES = [
   'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
   'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
+  'C:\\Program Files\\BraveSoftware\\Brave-Browser\\Application\\brave.exe',
+  'C:\\Program Files (x86)\\BraveSoftware\\Brave-Browser\\Application\\brave.exe',
+  'C:\\Program Files\\Chromium\\Application\\chrome.exe',
+  'C:\\Program Files (x86)\\Chromium\\Application\\chrome.exe',
   'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe',
   'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
 ].filter(Boolean);
+const WINDOWS_LOCAL_BROWSER_PATH_CANDIDATES = [
+  process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'Google', 'Chrome', 'Application', 'chrome.exe') : '',
+  process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'Chromium', 'Application', 'chrome.exe') : '',
+  process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'BraveSoftware', 'Brave-Browser', 'Application', 'brave.exe') : '',
+].filter(Boolean);
+const MAC_BROWSER_PATH_CANDIDATES = [
+  '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+  '/Applications/Brave Browser.app/Contents/MacOS/Brave Browser',
+  '/Applications/Chromium.app/Contents/MacOS/Chromium',
+  '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge',
+];
+const LINUX_BROWSER_PATH_CANDIDATES = [
+  '/usr/bin/google-chrome-stable',
+  '/usr/bin/google-chrome',
+  '/usr/bin/chromium-browser',
+  '/usr/bin/chromium',
+  '/usr/bin/brave-browser',
+  '/usr/bin/microsoft-edge',
+  '/usr/bin/microsoft-edge-stable',
+  '/snap/bin/chromium',
+];
+const PATH_BROWSER_COMMAND_CANDIDATES = [
+  'chrome',
+  'chrome.exe',
+  'google-chrome',
+  'google-chrome-stable',
+  'chromium',
+  'chromium-browser',
+  'brave',
+  'brave.exe',
+  'brave-browser',
+  'msedge',
+  'msedge.exe',
+  'microsoft-edge',
+  'microsoft-edge-stable',
+];
 let mailTransporter = null;
 let mailTransporterName = 'console';
 let mailTransporterMode = 'console';
@@ -115,6 +169,26 @@ const parseCorsOrigins = () => {
 };
 
 const CORS_ORIGINS = parseCorsOrigins();
+
+const uniqueNonEmpty = (items) => [...new Set(items.filter(Boolean))];
+
+const getEmailLogoPath = () =>
+  EMAIL_LOGO_PATH_CANDIDATES.find((candidatePath) => fs.existsSync(candidatePath)) || '';
+
+const getEmailLogoPublicUrl = () => {
+  if (EMAIL_LOGO_URL) {
+    return EMAIL_LOGO_URL;
+  }
+
+  const logoPath = getEmailLogoPath();
+  if (!logoPath || !BACKEND_URL) {
+    return '';
+  }
+
+  return `${BACKEND_URL}${EMAIL_LOGO_PUBLIC_PATH}`;
+};
+
+const shouldUseInlineEmailLogo = () => !getEmailLogoPublicUrl() && Boolean(getEmailLogoPath());
 
 const isBrevoHost = (host) => String(host || '').trim().toLowerCase() === BREVO_SMTP_HOST;
 
@@ -405,6 +479,16 @@ app.get('/readyz', (req, res) => {
   });
 });
 
+app.get(EMAIL_LOGO_PUBLIC_PATH, (req, res) => {
+  const logoPath = getEmailLogoPath();
+  if (!logoPath) {
+    return res.status(404).end();
+  }
+
+  res.setHeader('Cache-Control', 'public, max-age=86400');
+  return res.sendFile(logoPath);
+});
+
 const seededNotifications = [];
 
 const buildSeedAvatar = (name) =>
@@ -675,12 +759,66 @@ const canApproveAsL2 = (user, mrn) =>
     && normalizeDepartmentName(user.department) === 'Materials'
   );
 
+const findExecutableOnPath = (command) => {
+  try {
+    const lookupCommand = process.platform === 'win32' ? 'where.exe' : 'which';
+    const output = execFileSync(lookupCommand, [command], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    const match = output
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .find(Boolean);
+
+    return match || '';
+  } catch {
+    return '';
+  }
+};
+
+const getAutoDetectedBrowserCandidates = () => {
+  const platformCandidates =
+    process.platform === 'win32'
+      ? [...WINDOWS_BROWSER_PATH_CANDIDATES, ...WINDOWS_LOCAL_BROWSER_PATH_CANDIDATES]
+      : process.platform === 'darwin'
+        ? MAC_BROWSER_PATH_CANDIDATES
+        : LINUX_BROWSER_PATH_CANDIDATES;
+
+  const pathCandidates = PATH_BROWSER_COMMAND_CANDIDATES
+    .map(findExecutableOnPath)
+    .filter(Boolean);
+
+  return uniqueNonEmpty([
+    ...PUPPETEER_ENV_EXECUTABLE_CANDIDATES,
+    ...platformCandidates,
+    ...pathCandidates,
+  ]);
+};
+
+const getBundledBrowserExecutablePath = () => {
+  try {
+    const executablePath = typeof puppeteer.executablePath === 'function'
+      ? puppeteer.executablePath()
+      : '';
+    return executablePath && fs.existsSync(executablePath) ? executablePath : '';
+  } catch {
+    return '';
+  }
+};
+
 const resolveBrowserExecutablePath = () => {
-  const executablePath = PUPPETEER_EXECUTABLE_CANDIDATES.find((candidate) => fs.existsSync(candidate));
+  const bundledExecutablePath = getBundledBrowserExecutablePath();
+  if (bundledExecutablePath) {
+    return bundledExecutablePath;
+  }
+
+  const executablePath = getAutoDetectedBrowserCandidates()
+    .find((candidate) => fs.existsSync(candidate));
 
   if (!executablePath) {
     throw new Error(
-      'No Chromium browser executable was found for PDF export. Set PUPPETEER_EXECUTABLE_PATH or install Chrome/Edge.'
+      'No supported browser executable was found for PDF export. Install Chrome, Brave, Chromium, or Edge, or provide an explicit executable path.'
     );
   }
 
@@ -817,20 +955,31 @@ const escapeHtml = (value) =>
 const nl2br = (value) => escapeHtml(value).replace(/\r?\n/g, '<br />');
 
 const getEmailLogoAttachments = () =>
-  fs.existsSync(EMAIL_LOGO_PATH)
+  shouldUseInlineEmailLogo()
     ? [{
         filename: 'tase-digital-logo.png',
-        path: EMAIL_LOGO_PATH,
+        path: getEmailLogoPath(),
         cid: EMAIL_LOGO_CID,
       }]
     : [];
 
-const buildEmailBrandMark = () =>
-  fs.existsSync(EMAIL_LOGO_PATH)
-    ? `<div style="display: inline-flex; align-items: center; justify-content: center; min-width: 180px; max-width: 220px; border-radius: 26px; background-color: #ffffff; padding: 14px 18px; box-shadow: 0 16px 34px rgba(60, 14, 121, 0.22); border: 1px solid rgba(226, 232, 240, 0.95);">
-        <img src="cid:${EMAIL_LOGO_CID}" alt="TASE Digital logo" width="180" style="display: block; width: 100%; max-width: 180px; height: auto;" />
+const buildEmailBrandMark = () => {
+  const publicLogoUrl = getEmailLogoPublicUrl();
+
+  if (publicLogoUrl) {
+    return `<div style="display: inline-flex; align-items: center; justify-content: center; min-width: 180px; max-width: 220px; border-radius: 26px; background-color: #ffffff; padding: 14px 18px; box-shadow: 0 16px 34px rgba(60, 14, 121, 0.22); border: 1px solid rgba(226, 232, 240, 0.95);">
+        <img src="${escapeHtml(publicLogoUrl)}" alt="TASE Digital logo" width="180" style="display: block; width: 100%; max-width: 180px; height: auto;" />
       </div>`
-    : `<div style="min-width: 180px; border-radius: 26px; background-color: #ffffff; color: #3c0e79; font-size: 28px; font-weight: 700; line-height: 1; text-align: center; padding: 22px 18px; box-shadow: 0 16px 34px rgba(60, 14, 121, 0.22); border: 1px solid rgba(226, 232, 240, 0.95);">TASE</div>`;
+  }
+
+  if (shouldUseInlineEmailLogo()) {
+    return `<div style="display: inline-flex; align-items: center; justify-content: center; min-width: 180px; max-width: 220px; border-radius: 26px; background-color: #ffffff; padding: 14px 18px; box-shadow: 0 16px 34px rgba(60, 14, 121, 0.22); border: 1px solid rgba(226, 232, 240, 0.95);">
+        <img src="cid:${EMAIL_LOGO_CID}" alt="TASE Digital logo" width="180" style="display: block; width: 100%; max-width: 180px; height: auto;" />
+      </div>`;
+  }
+
+  return `<div style="min-width: 180px; border-radius: 26px; background-color: #ffffff; color: #3c0e79; font-size: 28px; font-weight: 700; line-height: 1; text-align: center; padding: 22px 18px; box-shadow: 0 16px 34px rgba(60, 14, 121, 0.22); border: 1px solid rgba(226, 232, 240, 0.95);">TASE</div>`;
+};
 
 const buildEmailShell = ({
   preheader,
@@ -2793,45 +2942,66 @@ const listenOnPort = (port) => new Promise((resolve, reject) => {
 });
 
 const startServer = async () => {
-  await initializeDatabase();
-  await hydrateStateFromDatabase();
-  validateRuntimeConfig();
-  await initMailTransporter();
-  let port = Number(process.env.PORT || 4000);
-  const maxAttempts = 5;
+  try {
+    console.log('\n🚀 Starting MRS Backend Server...\n');
+    
+    console.log('📡 Initializing SQLite database...');
+    await initializeDatabase();
+    console.log('✅ Database connection successful\n');
 
-  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
-    try {
-      await listenOnPort(port);
-      console.log(`MRS backend running on http://localhost:${port}`);
-      console.log(`Database driver: ${getDatabaseDriver()}`);
-      console.log(`Mail transport: ${mailTransporterMode === 'console' ? 'console' : mailTransporterName}`);
-      if (!process.env.JWT_SECRET && !IS_PRODUCTION) {
-        console.log('JWT_SECRET is not set. A temporary runtime secret was generated for this session.');
+    console.log('💾 Hydrating state from database...');
+    await hydrateStateFromDatabase();
+    console.log('✅ State hydration complete\n');
+
+    console.log('🔧 Validating runtime configuration...');
+    validateRuntimeConfig();
+    console.log('✅ Configuration valid\n');
+
+    console.log('📧 Initializing mail transporter...');
+    await initMailTransporter();
+    console.log('✅ Mail transporter ready\n');
+
+    let port = Number(process.env.PORT || 4000);
+    const maxAttempts = 5;
+
+    for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+      try {
+        await listenOnPort(port);
+        console.log(`\n✅ MRS backend running on http://localhost:${port}`);
+        console.log(`📊 Database driver: ${getDatabaseDriver()}`);
+        console.log(`📬 Mail transport: ${mailTransporterMode === 'console' ? 'console' : mailTransporterName}`);
+        if (!process.env.JWT_SECRET && !IS_PRODUCTION) {
+          console.log('⚠️  JWT_SECRET is not set. A temporary runtime secret was generated for this session.');
+        }
+        if (!IS_PRODUCTION) {
+          const enabledAdminLogins = buildBootstrapAdminConfigs()
+            .map((config) => `${config.employeeCode} (${config.email})`)
+            .join(', ');
+          console.log(`👤 Bootstrap admin logins enabled for ${enabledAdminLogins}`);
+        }
+        if (port !== Number(process.env.PORT || 4000)) {
+          console.log(`🔄 Port 4000 was in use, server started on fallback port ${port}.`);
+        }
+        console.log('\n🎉 Server ready for requests!\n');
+        return;
+      } catch (error) {
+        if (error && error.code === 'EADDRINUSE') {
+          console.warn(`⚠️  Port ${port} is already in use, trying port ${port + 1}...`);
+          port += 1;
+          continue;
+        }
+        throw error;
       }
-      if (!IS_PRODUCTION) {
-        const enabledAdminLogins = buildBootstrapAdminConfigs()
-          .map((config) => `${config.employeeCode} (${config.email})`)
-          .join(', ');
-        console.log(`Bootstrap admin logins enabled for ${enabledAdminLogins}`);
-      }
-      if (port !== Number(process.env.PORT || 4000)) {
-        console.log(`Port 4000 was in use, so the server started on fallback port ${port}.`);
-      }
-      return;
-    } catch (error) {
-      if (error && error.code === 'EADDRINUSE') {
-        console.warn(`Port ${port} is already in use, trying port ${port + 1}...`);
-        port += 1;
-        continue;
-      }
-      console.error('Failed to start server:', error);
-      process.exit(1);
     }
-  }
 
-  console.error(`Unable to start MRS backend after ${maxAttempts} attempts.`);
-  process.exit(1);
+    console.error(`❌ Unable to start MRS backend after ${maxAttempts} attempts.`);
+    process.exit(1);
+  } catch (error) {
+    console.error('\n❌ Failed to start server:', error.message);
+    console.error('\n📋 Server startup failed. Verify backend/.env and ensure MRN_DB_PATH points to a writable SQLite file.\n');
+
+    process.exit(1);
+  }
 };
 
 startServer();
