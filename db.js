@@ -12,11 +12,14 @@ const configuredDbPath = String(process.env.MRN_DB_PATH || '').trim();
 const resolvedDbPath = configuredDbPath
   ? (path.isAbsolute(configuredDbPath) ? configuredDbPath : path.resolve(__dirname, configuredDbPath))
   : DEFAULT_DB_PATH;
-const activeDriver = 'sqlite';
 
-let database = null;
+const configuredDriver = String(process.env.MRN_DB_DRIVER || 'sqlite').trim().toLowerCase();
+const activeDriver = configuredDriver === 'postgres' ? 'postgres' : 'sqlite';
+
+let database = null; // sqlite DatabaseSync instance
 let statements = null;
 let writeQueue = Promise.resolve();
+let pgPool = null; // Postgres Pool when using postgres
 
 const debug = (message, details = '') => {
   if (process.env.DEBUG_DB === 'true') {
@@ -66,7 +69,49 @@ const initializeSqlite = () => {
   return database;
 };
 
-const ensureDatabase = () => initializeSqlite();
+const initializePostgres = async () => {
+  if (pgPool) return pgPool;
+
+  const connectionString = String(
+    process.env.MRN_DATABASE_URL || process.env.DATABASE_URL || process.env.NEON_DATABASE_URL || ''
+  ).trim();
+
+  if (!connectionString) {
+    throw new Error('MRN_DATABASE_URL (or DATABASE_URL) must be set for Postgres driver');
+  }
+
+  const { Pool } = await import('pg');
+
+  // Neon requires SSL; allow NODE env to override if needed
+  const ssl = process.env.PGDONTVERIFY === 'true' ? false : { rejectUnauthorized: false };
+
+  pgPool = new Pool({ connectionString, ssl });
+
+  // Ensure table exists
+  await pgPool.query(`
+    CREATE TABLE IF NOT EXISTS app_state (
+      state_key TEXT PRIMARY KEY,
+      payload TEXT NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+  `);
+
+  await pgPool.query(`
+    CREATE INDEX IF NOT EXISTS idx_app_state_updated_at
+      ON app_state(updated_at);
+  `);
+
+  debug('Postgres database initialized');
+  return pgPool;
+};
+
+const ensureDatabase = () => {
+  if (activeDriver === 'postgres') {
+    return initializePostgres();
+  }
+
+  return initializeSqlite();
+};
 
 const cloneFallback = (value) => structuredClone(value);
 
@@ -82,9 +127,21 @@ const deserializePayload = (key, payload) => {
 };
 
 const saveToSqlite = (key, value) => {
-  const db = ensureDatabase();
+  const db = initializeSqlite();
   statements ??= initializeStatements(db);
   statements.upsertState.run(key, serializePayload(value));
+};
+
+const saveToPostgres = async (key, value) => {
+  const pool = await initializePostgres();
+  await pool.query(
+    `INSERT INTO app_state (state_key, payload, updated_at)
+     VALUES ($1, $2, CURRENT_TIMESTAMP)
+     ON CONFLICT (state_key) DO UPDATE SET
+       payload = EXCLUDED.payload,
+       updated_at = EXCLUDED.updated_at`,
+    [key, serializePayload(value)]
+  );
 };
 
 const queueWrite = (operation) => {
@@ -99,12 +156,39 @@ const queueWrite = (operation) => {
 };
 
 export const initializeDatabase = async () => {
-  ensureDatabase();
+  await ensureDatabase();
 };
 
 export const getDatabaseDriver = () => activeDriver;
 
 export const loadCollection = async (key, fallbackValue) => {
+  if (activeDriver === 'postgres') {
+    try {
+      const pool = await initializePostgres();
+      const res = await pool.query('SELECT payload FROM app_state WHERE state_key = $1', [key]);
+      if (!res.rows || res.rows.length === 0) {
+        const initialValue = cloneFallback(fallbackValue);
+        await saveCollectionStrict(key, initialValue);
+        return initialValue;
+      }
+
+      const parsed = deserializePayload(key, res.rows[0].payload);
+      if (parsed === null) {
+        const initialValue = cloneFallback(fallbackValue);
+        await saveCollectionStrict(key, initialValue);
+        return initialValue;
+      }
+
+      return parsed;
+    } catch (err) {
+      console.error(`[DB ERROR] Error loading collection "${key}"`, err?.message || err || '');
+      const initialValue = cloneFallback(fallbackValue);
+      await saveCollectionStrict(key, initialValue);
+      return initialValue;
+    }
+  }
+
+  // sqlite path
   ensureDatabase();
 
   try {
@@ -134,14 +218,32 @@ export const loadCollection = async (key, fallbackValue) => {
 
 export const saveCollection = (key, value) =>
   queueWrite(async () => {
+    if (activeDriver === 'postgres') {
+      await saveToPostgres(key, value);
+      return;
+    }
+
     saveToSqlite(key, value);
   });
 
 export const saveCollectionStrict = async (key, value) => {
+  if (activeDriver === 'postgres') {
+    await saveToPostgres(key, value);
+    return;
+  }
+
   saveToSqlite(key, value);
 };
 
 export const closeDatabase = async () => {
+  if (activeDriver === 'postgres') {
+    if (!pgPool) return;
+    await pgPool.end();
+    pgPool = null;
+    debug('Postgres pool closed');
+    return;
+  }
+
   if (!database) {
     return;
   }
