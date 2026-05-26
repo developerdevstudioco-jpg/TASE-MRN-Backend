@@ -1097,6 +1097,8 @@ const sanitizeQty = (value) => {
 const getRequestedQty = (item) => sanitizeQty(item.requestedQty ?? item.qty);
 const getIssuedQty = (item) => sanitizeQty(item.issuedQty);
 const getReturnedQty = (item) => sanitizeQty(item.returnedQty);
+const RETURN_REQUEST_STATUSES = ['Requested', 'Accepted', 'Received'];
+const ISSUE_TIMELINE_LABELS = new Set(['issued', 'partial issue recorded']);
 const CLOSED_MRN_STATUSES = ['Rejected', 'Issued', 'Returned', 'Not Available'];
 
 const getMaterialApprovalStatus = (item) => {
@@ -1217,6 +1219,84 @@ const normalizeMaterial = (item) => {
     ...normalized,
     status: deriveMaterialStatus(normalized),
   };
+};
+
+const normalizeReturnRequestLine = (line) => ({
+  materialId: String(line.materialId || line.id || '').trim(),
+  materialCode: String(line.materialCode || '').trim(),
+  description: String(line.description || '').trim(),
+  uom: String(line.uom || 'PCS').trim(),
+  issuedQty: sanitizeQty(line.issuedQty),
+  alreadyReturnedQty: sanitizeQty(line.alreadyReturnedQty),
+  requestedReturnQty: sanitizeQty(line.requestedReturnQty ?? line.returnQty),
+  grnNumber: String(line.grnNumber || '').trim(),
+});
+
+const normalizeReturnRequest = (request) => ({
+  id: String(request.id || `rr-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`).trim(),
+  status: RETURN_REQUEST_STATUSES.includes(String(request.status || '').trim())
+    ? String(request.status).trim()
+    : 'Requested',
+  requesterName: String(request.requesterName || '').trim(),
+  requesterRole: String(request.requesterRole || 'Requester').trim(),
+  reason: String(request.reason || '').trim(),
+  submittedAt: String(request.submittedAt || new Date().toISOString()).trim(),
+  acceptedAt: String(request.acceptedAt || '').trim(),
+  acceptedBy: String(request.acceptedBy || '').trim(),
+  acceptedNote: String(request.acceptedNote || '').trim(),
+  receivedAt: String(request.receivedAt || '').trim(),
+  receivedBy: String(request.receivedBy || '').trim(),
+  receivedNote: String(request.receivedNote || '').trim(),
+  lines: Array.isArray(request.lines) ? request.lines.map(normalizeReturnRequestLine) : [],
+});
+
+const getActiveReturnRequest = (mrn) =>
+  (Array.isArray(mrn?.returnRequests) ? mrn.returnRequests : []).find((request) => request.status !== 'Received') || null;
+
+const getLatestIssueActorName = (mrn) =>
+  [...(mrn?.timeline || [])]
+    .reverse()
+    .find((step) =>
+      step?.status === 'completed'
+      && ISSUE_TIMELINE_LABELS.has(String(step.label || '').trim().toLowerCase())
+    )?.actor || '';
+
+const getAssignedIssuerUser = (mrn) => {
+  const actorName = getLatestIssueActorName(mrn);
+  if (!actorName) {
+    return null;
+  }
+
+  return users.find((user) =>
+    (user.role === 'Issuer' || user.role === 'Admin')
+    && user.name === actorName
+  ) || null;
+};
+
+const getReturnHandlerUsers = (mrn) => {
+  const assignedIssuer = getAssignedIssuerUser(mrn);
+  if (assignedIssuer) {
+    return [assignedIssuer];
+  }
+
+  return users.filter((user) => user.role === 'Issuer' || user.role === 'Admin');
+};
+
+const canHandleReturnRequest = (user, mrn) => {
+  if (!user) {
+    return false;
+  }
+
+  if (user.role === 'Admin') {
+    return true;
+  }
+
+  if (user.role !== 'Issuer') {
+    return false;
+  }
+
+  const assignedIssuer = getAssignedIssuerUser(mrn);
+  return assignedIssuer ? assignedIssuer.id === user.id : true;
 };
 
 const pushNotification = ({ userId, title, message, type = 'system', mrnId }) => {
