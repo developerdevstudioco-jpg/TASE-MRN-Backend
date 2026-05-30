@@ -1,0 +1,30 @@
+
+> tase-digital-mrn-backend@0.1.0 dev
+> node server.js
+
+◇ injected env (32) from .env // tip: ⌁ auth for agents [www.vestauth.com]
+◇ injected env (0) from .env // tip: ⌘ multiple files { path: ['.env.local', '.env'] }
+
+🚀 Starting MRS Backend Server...
+
+📡 Initializing SQLite database...
+✅ Database connection successful
+
+💾 Hydrating state from database...
+✅ State hydration complete
+
+🔧 Validating runtime configuration...
+✅ Configuration valid
+
+📧 Initializing mail transporter...
+SMTP mail transport configured via smtp-relay.brevo.com
+✅ Mail transporter ready
+
+
+✅ MRS backend running on http://localhost:4000
+📊 Database driver: postgres
+📬 Mail transport: smtp-relay.brevo.com
+👤 Bootstrap admin logins enabled for 279 (somaskandhanmj@gmail.com), 266 (rishi.v@taseglobal.com)
+
+🎉 Server ready for requests!
+

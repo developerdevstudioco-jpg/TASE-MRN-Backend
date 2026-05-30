@@ -5,7 +5,6 @@ import nodemailer from 'nodemailer';
 import dotenv from 'dotenv';
 import fs from 'node:fs';
 import path from 'node:path';
-import { execFileSync } from 'node:child_process';
 import { randomBytes, scryptSync, timingSafeEqual } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import puppeteer from 'puppeteer';
@@ -72,55 +71,10 @@ const EMAIL_LOGO_PATH_CANDIDATES = [
 ].filter(Boolean);
 const EMAIL_LOGO_CID = 'tase-digital-logo';
 const EMAIL_LOGO_URL = String(process.env.EMAIL_LOGO_URL || '').trim();
-const PUPPETEER_ENV_EXECUTABLE_CANDIDATES = [
-  process.env.PUPPETEER_EXECUTABLE_PATH,
-  process.env.CHROME_BIN,
-].filter(Boolean);
-const WINDOWS_BROWSER_PATH_CANDIDATES = [
-  'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
-  'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
-  'C:\\Program Files\\BraveSoftware\\Brave-Browser\\Application\\brave.exe',
-  'C:\\Program Files (x86)\\BraveSoftware\\Brave-Browser\\Application\\brave.exe',
-  'C:\\Program Files\\Chromium\\Application\\chrome.exe',
-  'C:\\Program Files (x86)\\Chromium\\Application\\chrome.exe',
-  'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe',
-  'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
-].filter(Boolean);
-const WINDOWS_LOCAL_BROWSER_PATH_CANDIDATES = [
-  process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'Google', 'Chrome', 'Application', 'chrome.exe') : '',
-  process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'Chromium', 'Application', 'chrome.exe') : '',
-  process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'BraveSoftware', 'Brave-Browser', 'Application', 'brave.exe') : '',
-].filter(Boolean);
-const MAC_BROWSER_PATH_CANDIDATES = [
-  '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
-  '/Applications/Brave Browser.app/Contents/MacOS/Brave Browser',
-  '/Applications/Chromium.app/Contents/MacOS/Chromium',
-  '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge',
-];
-const LINUX_BROWSER_PATH_CANDIDATES = [
-  '/usr/bin/google-chrome-stable',
-  '/usr/bin/google-chrome',
-  '/usr/bin/chromium-browser',
-  '/usr/bin/chromium',
-  '/usr/bin/brave-browser',
-  '/usr/bin/microsoft-edge',
-  '/usr/bin/microsoft-edge-stable',
-  '/snap/bin/chromium',
-];
-const PATH_BROWSER_COMMAND_CANDIDATES = [
-  'chrome',
-  'chrome.exe',
-  'google-chrome',
-  'google-chrome-stable',
-  'chromium',
-  'chromium-browser',
-  'brave',
-  'brave.exe',
-  'brave-browser',
-  'msedge',
-  'msedge.exe',
-  'microsoft-edge',
-  'microsoft-edge-stable',
+const PUPPETEER_EXECUTABLE_ENV_KEYS = [
+  'PUPPETEER_EXECUTABLE_PATH',
+  'CHROME_BIN',
+  'BROWSER_EXECUTABLE_PATH',
 ];
 let mailTransporter = null;
 let mailTransporterName = 'console';
@@ -169,8 +123,6 @@ const parseCorsOrigins = () => {
 };
 
 const CORS_ORIGINS = parseCorsOrigins();
-
-const uniqueNonEmpty = (items) => [...new Set(items.filter(Boolean))];
 
 const getEmailLogoPath = () =>
   EMAIL_LOGO_PATH_CANDIDATES.find((candidatePath) => fs.existsSync(candidatePath)) || '';
@@ -552,11 +504,13 @@ const seededUsers = [
 
 const seededMrns = [];
 const seededHistoryRecords = [];
+const seededL1ApproverMappings = [];
 
 let notifications = structuredClone(seededNotifications);
 let users = structuredClone(seededUsers);
 let mrns = structuredClone(seededMrns);
 let historyRecords = structuredClone(seededHistoryRecords);
+let l1ApproverMappings = structuredClone(seededL1ApproverMappings);
 let passwordResetRequests = [];
 
 const authenticate = (req, res, next) => {
@@ -699,6 +653,8 @@ const hasSystemAdminAccess = (user) =>
   Boolean(user && (user.role === 'Admin' || user.role === 'Management' || isQmsDepartment(user.department)));
 const canCreateMRS = (user) =>
   Boolean(user && ['Admin', 'Requester', 'L1 Approver', 'L2 Approver', 'Issuer'].includes(user.role));
+const canManageL1Mappings = (user) =>
+  Boolean(user && (user.role === 'Admin' || user.role === 'Management'));
 const canReturnMRS = (user, mrn) =>
   Boolean(
     user
@@ -707,6 +663,71 @@ const canReturnMRS = (user, mrn) =>
       || (canCreateMRS(user) && mrn?.requester === user.name)
     )
   );
+
+const getUserById = (userId) =>
+  users.find((user) => user.id === userId) || null;
+
+const getActiveL1Approvers = () =>
+  users.filter((user) => user.role === 'L1 Approver' && user.status !== 'Inactive');
+
+const getL1MappingForRequester = (requesterUserId) =>
+  l1ApproverMappings.find((mapping) => mapping.requesterUserId === requesterUserId) || null;
+
+const getAssignedL1ApproverForRequester = (requester) => {
+  if (!requester) {
+    return null;
+  }
+
+  const mapping = getL1MappingForRequester(requester.id);
+  if (!mapping) {
+    return null;
+  }
+
+  const approver = getUserById(mapping.l1ApproverUserId);
+  return approver?.role === 'L1 Approver' && approver.status !== 'Inactive' ? approver : null;
+};
+
+const getAssignedL1ApproverForMRN = (mrn) =>
+  getAssignedL1ApproverForRequester(getRequesterUser(mrn));
+
+const getL1ApprovalRouteForMRN = (mrn) => {
+  const assignedApprover = getAssignedL1ApproverForMRN(mrn);
+  if (assignedApprover) {
+    return {
+      mode: 'mapped',
+      approverId: assignedApprover.id,
+      approverName: assignedApprover.name,
+    };
+  }
+
+  return {
+    mode: 'department',
+    approverId: '',
+    approverName: '',
+  };
+};
+
+const decorateMRNForResponse = (mrn) => {
+  const l1Route = getL1ApprovalRouteForMRN(mrn);
+  return {
+    ...mrn,
+    l1ApprovalMode: l1Route.mode,
+    l1ApproverId: l1Route.approverId,
+    l1ApproverName: l1Route.approverName,
+  };
+};
+
+const getL1NotificationTargets = (mrn) => {
+  const assignedApprover = getAssignedL1ApproverForMRN(mrn);
+  if (assignedApprover) {
+    return [assignedApprover];
+  }
+
+  return getActiveL1Approvers().filter((user) =>
+    normalizeDepartmentName(user.department) === normalizeDepartmentName(mrn.department)
+    && user.name !== mrn.requester
+  );
+};
 
 const canReadMRS = (user, mrn) => {
   if (!user || !mrn) {
@@ -744,13 +765,18 @@ const getVisibleMRNs = (user) => {
   return [];
 };
 
-const canApproveAsL1 = (user, mrn) =>
-  Boolean(
-    user
-    && user.role === 'L1 Approver'
-    && normalizeDepartmentName(user.department) === normalizeDepartmentName(mrn.department)
-    && mrn.requester !== user.name
-  );
+const canApproveAsL1 = (user, mrn) => {
+  if (!user || !mrn || user.role !== 'L1 Approver' || mrn.requester === user.name) {
+    return false;
+  }
+
+  const assignedApprover = getAssignedL1ApproverForMRN(mrn);
+  if (assignedApprover) {
+    return assignedApprover.id === user.id;
+  }
+
+  return normalizeDepartmentName(user.department) === normalizeDepartmentName(mrn.department);
+};
 
 const canApproveAsL2 = (user, mrn) =>
   Boolean(
@@ -759,70 +785,100 @@ const canApproveAsL2 = (user, mrn) =>
     && normalizeDepartmentName(user.department) === 'Materials'
   );
 
-const findExecutableOnPath = (command) => {
-  try {
-    const lookupCommand = process.platform === 'win32' ? 'where.exe' : 'which';
-    const output = execFileSync(lookupCommand, [command], {
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'ignore'],
-    });
-    const match = output
-      .split(/\r?\n/)
-      .map((line) => line.trim())
-      .find(Boolean);
+const normalizeExecutablePath = (candidate) => {
+  const value = String(candidate || '')
+    .trim()
+    .replace(/^["']|["']$/g, '');
 
-    return match || '';
-  } catch {
-    return '';
+  return value ? path.normalize(value) : '';
+};
+
+const isWindowsExecutablePath = (candidate) => /^[a-zA-Z]:[\\/]/.test(String(candidate || ''));
+
+const summarizeError = (error) => ({
+  name: error?.name || 'Error',
+  message: error?.message || String(error),
+  stack: error?.stack,
+});
+
+const getExplicitBrowserExecutablePath = () => {
+  for (const key of PUPPETEER_EXECUTABLE_ENV_KEYS) {
+    const executablePath = normalizeExecutablePath(process.env[key]);
+    if (!executablePath) {
+      continue;
+    }
+
+    if (process.platform !== 'win32' && isWindowsExecutablePath(executablePath)) {
+      console.warn(`[pdf] Ignoring ${key}; Windows browser paths are not valid in this ${process.platform} runtime.`);
+      continue;
+    }
+
+    if (!fs.existsSync(executablePath)) {
+      throw new Error(`[pdf] ${key} is set but the file does not exist: ${executablePath}`);
+    }
+
+    return executablePath;
   }
+
+  return '';
 };
 
-const getAutoDetectedBrowserCandidates = () => {
-  const platformCandidates =
-    process.platform === 'win32'
-      ? [...WINDOWS_BROWSER_PATH_CANDIDATES, ...WINDOWS_LOCAL_BROWSER_PATH_CANDIDATES]
-      : process.platform === 'darwin'
-        ? MAC_BROWSER_PATH_CANDIDATES
-        : LINUX_BROWSER_PATH_CANDIDATES;
-
-  const pathCandidates = PATH_BROWSER_COMMAND_CANDIDATES
-    .map(findExecutableOnPath)
-    .filter(Boolean);
-
-  return uniqueNonEmpty([
-    ...PUPPETEER_ENV_EXECUTABLE_CANDIDATES,
-    ...platformCandidates,
-    ...pathCandidates,
-  ]);
-};
-
-const getBundledBrowserExecutablePath = () => {
+const getPuppeteerManagedBrowserPath = () => {
   try {
-    const executablePath = typeof puppeteer.executablePath === 'function'
-      ? puppeteer.executablePath()
-      : '';
-    return executablePath && fs.existsSync(executablePath) ? executablePath : '';
-  } catch {
+    const executablePath = normalizeExecutablePath(
+      typeof puppeteer.executablePath === 'function' ? puppeteer.executablePath() : ''
+    );
+
+    if (!executablePath) {
+      return '';
+    }
+
+    if (!fs.existsSync(executablePath)) {
+      console.warn(`[pdf] Puppeteer resolved Chrome at ${executablePath}, but the file is missing.`);
+      return '';
+    }
+
+    return executablePath;
+  } catch (error) {
+    console.warn('[pdf] Puppeteer could not resolve its managed Chrome executable.', summarizeError(error));
     return '';
   }
 };
 
 const resolveBrowserExecutablePath = () => {
-  const bundledExecutablePath = getBundledBrowserExecutablePath();
-  if (bundledExecutablePath) {
-    return bundledExecutablePath;
+  const explicitExecutablePath = getExplicitBrowserExecutablePath();
+  if (explicitExecutablePath) {
+    return explicitExecutablePath;
   }
 
-  const executablePath = getAutoDetectedBrowserCandidates()
-    .find((candidate) => fs.existsSync(candidate));
-
-  if (!executablePath) {
-    throw new Error(
-      'No supported browser executable was found for PDF export. Install Chrome, Brave, Chromium, or Edge, or provide an explicit executable path.'
-    );
+  const managedExecutablePath = getPuppeteerManagedBrowserPath();
+  if (managedExecutablePath) {
+    return managedExecutablePath;
   }
 
-  return executablePath;
+  return undefined;
+};
+
+const buildBrowserLaunchOptions = () => {
+  const executablePath = resolveBrowserExecutablePath();
+
+  return {
+    ...(executablePath ? { executablePath } : {}),
+    headless: true,
+    timeout: 120000,
+    protocolTimeout: 120000,
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-gpu',
+      '--no-first-run',
+      '--no-default-browser-check',
+      '--disable-background-networking',
+      '--disable-background-timer-throttling',
+      '--disable-renderer-backgrounding',
+    ],
+  };
 };
 
 const buildPdfHtmlDocument = ({ content, styles = '', title = 'Document', baseUrl = '' }) => `<!doctype html>
@@ -851,6 +907,12 @@ const buildPdfHtmlDocument = ({ content, styles = '', title = 'Document', baseUr
         box-sizing: border-box;
         width: 297mm;
         height: 210mm;
+      }
+
+      .mrn-document-stack {
+        display: flex;
+        flex-direction: column;
+        gap: 0;
       }
 
       .mrn-document-table {
@@ -886,15 +948,38 @@ const generatePdfBuffer = async ({
   margin = 5,
   baseUrl = '',
 }) => {
-  const browser = await puppeteer.launch({
-    executablePath: resolveBrowserExecutablePath(),
-    headless: 'new',
-    timeout: 120000,
-    args: ['--disable-dev-shm-usage', '--no-first-run', '--no-default-browser-check'],
-  });
+  const launchOptions = buildBrowserLaunchOptions();
+  let browser;
+
+  try {
+    console.info('[pdf] Launching browser for PDF export.', {
+      library: 'puppeteer',
+      executablePath: launchOptions.executablePath || 'puppeteer-managed',
+      cacheDir: process.env.PUPPETEER_CACHE_DIR || 'default',
+      platform: process.platform,
+    });
+    browser = await puppeteer.launch(launchOptions);
+  } catch (error) {
+    console.error('[pdf] Browser launch failed.', summarizeError(error));
+    throw new Error(
+      `PDF browser launch failed: ${error?.message || error}. ` +
+      'On Render, use backend build command "npm ci" so the Puppeteer postinstall script downloads Chrome, and do not set PUPPETEER_EXECUTABLE_PATH to a local machine path.'
+    );
+  }
 
   try {
     const page = await browser.newPage();
+    page.on('pageerror', (error) => {
+      console.warn('[pdf] Page script error during PDF render.', summarizeError(error));
+    });
+    page.on('requestfailed', (request) => {
+      const failure = request.failure();
+      console.warn('[pdf] Page asset request failed during PDF render.', {
+        url: request.url(),
+        errorText: failure?.errorText || 'unknown',
+      });
+    });
+
     await page.setViewport({ width: 1280, height: 1810, deviceScaleFactor: 1 });
     await page.setContent(
       buildPdfHtmlDocument({
@@ -939,8 +1024,17 @@ const generatePdfBuffer = async ({
         left: `${margin}mm`,
       },
     });
+  } catch (error) {
+    console.error('[pdf] PDF rendering failed.', summarizeError(error));
+    throw new Error(`PDF rendering failed: ${error?.message || error}`);
   } finally {
-    await browser.close();
+    if (browser) {
+      try {
+        await browser.close();
+      } catch (error) {
+        console.warn('[pdf] Browser close failed after PDF export.', summarizeError(error));
+      }
+    }
   }
 };
 
@@ -1300,7 +1394,7 @@ const canHandleReturnRequest = (user, mrn) => {
 };
 
 const pushNotification = ({ userId, title, message, type = 'system', mrnId }) => {
-  notifications.unshift({
+  const notification = {
     id: `n-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     userId,
     title,
@@ -1309,8 +1403,22 @@ const pushNotification = ({ userId, title, message, type = 'system', mrnId }) =>
     mrnId,
     read: false,
     timestamp: new Date().toISOString(),
-  });
+  };
+  notifications.unshift(notification);
   saveNotifications();
+  pushApplicationLog({
+    action: 'notification',
+    actor: 'System',
+    actorRole: 'System',
+    documentId: mrnId || notification.id,
+    status: type,
+    summary: `Notification sent: ${title}. ${message || ''}`.trim(),
+    snapshot: {
+      notificationId: notification.id,
+      targetUserId: userId,
+      type,
+    },
+  });
 };
 
 const pushHistoryRecord = ({ action, actor, actorRole, mrn, summary }) => {
@@ -1332,6 +1440,31 @@ const pushHistoryRecord = ({ action, actor, actorRole, mrn, summary }) => {
       priority: mrn.priority || 'Medium',
       itemCount: Array.isArray(mrn.materials) ? mrn.materials.length : 0,
     },
+  });
+  saveHistoryRecords();
+};
+
+const pushApplicationLog = ({
+  action = 'update',
+  actor = 'System',
+  actorRole = 'System',
+  documentId = 'APP',
+  department = '',
+  status = 'Recorded',
+  summary = 'Application action recorded.',
+  snapshot = {},
+} = {}) => {
+  historyRecords.unshift({
+    id: `h-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    timestamp: new Date().toISOString(),
+    documentId: String(documentId || 'APP'),
+    action,
+    actor: String(actor || 'System'),
+    actorRole: String(actorRole || 'System'),
+    department: normalizeDepartmentName(department || ''),
+    status: String(status || 'Recorded'),
+    summary: String(summary || 'Application action recorded.'),
+    snapshot,
   });
   saveHistoryRecords();
 };
@@ -1366,10 +1499,10 @@ const transitionRules = {
   Submitted: ['approve', 'hold', 'reject'],
   Hold: ['approve', 'hold', 'reject'],
   Approved: ['issue', 'issuer_hold', 'not_available'],
-  'Partially Issued': ['issue', 'issuer_hold', 'return'],
+  'Partially Issued': ['issue', 'issuer_hold'],
   Rejected: [],
-  Issued: ['return'],
-  'Partially Returned': ['return'],
+  Issued: [],
+  'Partially Returned': [],
   Returned: [],
   'Not Available': [],
 };
@@ -1446,6 +1579,7 @@ const saveUsers = () => saveCollection('users', users);
 const saveMrns = () => saveCollection('mrns', mrns);
 const saveNotifications = () => saveCollection('notifications', notifications);
 const saveHistoryRecords = () => saveCollection('historyRecords', historyRecords);
+const saveL1ApproverMappings = () => saveCollection('l1ApproverMappings', l1ApproverMappings);
 
 const ensureBootstrapAdmins = () => {
   const bootstrapConfigs = buildBootstrapAdminConfigs();
@@ -1510,6 +1644,53 @@ const normalizeStoredUsers = (items) =>
       lastActive: user.lastActive || new Date().toISOString(),
     };
   });
+
+const normalizeL1ApproverMappings = (items) => {
+  const mappings = Array.isArray(items) ? items : [];
+  const normalized = [];
+  const seenRequesters = new Set();
+
+  mappings.forEach((mapping) => {
+    const requesterUserId = String(mapping?.requesterUserId || '').trim();
+    const l1ApproverUserId = String(mapping?.l1ApproverUserId || '').trim();
+    if (!requesterUserId || !l1ApproverUserId || seenRequesters.has(requesterUserId)) {
+      return;
+    }
+
+    const requester = getUserById(requesterUserId);
+    const approver = getUserById(l1ApproverUserId);
+    if (!requester || !approver || approver.role !== 'L1 Approver') {
+      return;
+    }
+
+    seenRequesters.add(requesterUserId);
+    normalized.push({
+      id: String(mapping.id || `l1map_${requesterUserId}`).trim(),
+      requesterUserId,
+      l1ApproverUserId,
+      createdAt: String(mapping.createdAt || new Date().toISOString()),
+      updatedAt: String(mapping.updatedAt || mapping.createdAt || new Date().toISOString()),
+      updatedBy: String(mapping.updatedBy || 'System'),
+    });
+  });
+
+  return normalized;
+};
+
+const publicL1ApproverMapping = (mapping) => {
+  const requester = getUserById(mapping.requesterUserId);
+  const approver = getUserById(mapping.l1ApproverUserId);
+
+  return {
+    ...mapping,
+    requesterName: requester?.name || '',
+    requesterEmployeeCode: requester?.employeeCode || '',
+    requesterDepartment: requester?.department || '',
+    l1ApproverName: approver?.name || '',
+    l1ApproverEmployeeCode: approver?.employeeCode || '',
+    l1ApproverDepartment: approver?.department || '',
+  };
+};
 
 const normalizeHistoryRecords = (items) =>
   items
@@ -1602,6 +1783,9 @@ const normalizeMRNs = (items) => {
       issueHoldBy: String(mrn.issueHoldBy || '').trim(),
       issueHoldAt: String(mrn.issueHoldAt || '').trim(),
       materials: normalizedMaterials,
+      returnRequests: Array.isArray(mrn.returnRequests)
+        ? mrn.returnRequests.map(normalizeReturnRequest)
+        : [],
       grnNumber: String(mrn.grnNumber || '').trim() || summarizeGrnNumbers(normalizedMaterials),
     };
 
@@ -1619,9 +1803,11 @@ const hydrateStateFromDatabase = async () => {
   mrns = await loadCollection('mrns', seededMrns);
   notifications = await loadCollection('notifications', seededNotifications);
   historyRecords = await loadCollection('historyRecords', seededHistoryRecords);
+  l1ApproverMappings = await loadCollection('l1ApproverMappings', seededL1ApproverMappings);
 
   users = Array.isArray(users) ? normalizeStoredUsers(users) : normalizeStoredUsers(seededUsers);
   notifications = Array.isArray(notifications) ? notifications : structuredClone(seededNotifications);
+  l1ApproverMappings = normalizeL1ApproverMappings(l1ApproverMappings);
   const normalizedMrnPayload = Array.isArray(mrns) ? normalizeMRNs(mrns) : normalizeMRNs(seededMrns);
   mrns = normalizedMrnPayload.mrns;
   historyRecords = Array.isArray(historyRecords)
@@ -1638,6 +1824,7 @@ const hydrateStateFromDatabase = async () => {
     saveMrns(),
     saveNotifications(),
     saveHistoryRecords(),
+    saveL1ApproverMappings(),
   ]);
 };
 
@@ -1942,14 +2129,42 @@ app.post('/api/auth/login', (req, res) => {
     : findUserByEmployeeCode(normalizedEmployeeCode);
 
   if (!user || !verifyPassword(password, user.password)) {
+    pushApplicationLog({
+      action: 'login',
+      actor: normalizedEmail || normalizedEmployeeCode || 'Unknown',
+      actorRole: 'Unauthenticated',
+      documentId: 'AUTH',
+      status: 'Failed',
+      summary: `Failed login attempt for ${normalizedEmail || normalizedEmployeeCode || 'unknown user'}.`,
+    });
     return res.status(401).json({ message: 'Invalid credentials' });
   }
 
   if (user.status !== 'Active') {
+    pushApplicationLog({
+      action: 'login',
+      actor: user.name || user.email,
+      actorRole: user.role,
+      documentId: 'AUTH',
+      department: user.department,
+      status: 'Blocked',
+      summary: `${user.name} attempted login with inactive account.`,
+      snapshot: { userId: user.id, employeeCode: user.employeeCode },
+    });
     return res.status(403).json({ message: 'Your account is inactive. Please contact an administrator.' });
   }
 
   if (user.mustChangePassword) {
+    pushApplicationLog({
+      action: 'login',
+      actor: user.name || user.email,
+      actorRole: user.role,
+      documentId: 'AUTH',
+      department: user.department,
+      status: 'Password Setup Required',
+      summary: `${user.name} signed in and was routed to password setup.`,
+      snapshot: { userId: user.id, employeeCode: user.employeeCode },
+    });
     const setupToken = jwt.sign(
       {
         id: user.id,
@@ -1970,6 +2185,16 @@ app.post('/api/auth/login', (req, res) => {
 
   user.lastActive = new Date().toISOString();
   saveUsers();
+  pushApplicationLog({
+    action: 'login',
+    actor: user.name || user.email,
+    actorRole: user.role,
+    documentId: 'AUTH',
+    department: user.department,
+    status: 'Success',
+    summary: `${user.name} logged in successfully.`,
+    snapshot: { userId: user.id, employeeCode: user.employeeCode },
+  });
 
   const token = jwt.sign(
     {
@@ -2027,6 +2252,16 @@ app.post('/api/auth/setup-password', (req, res) => {
   user.mustChangePassword = false;
   user.lastActive = new Date().toISOString();
   saveUsers();
+  pushApplicationLog({
+    action: 'password_change',
+    actor: user.name || user.email,
+    actorRole: user.role,
+    documentId: 'AUTH',
+    department: user.department,
+    status: 'Completed',
+    summary: `${user.name} changed initial password.`,
+    snapshot: { userId: user.id, employeeCode: user.employeeCode },
+  });
 
   const token = jwt.sign(
     {
@@ -2046,6 +2281,22 @@ app.post('/api/auth/setup-password', (req, res) => {
   });
 });
 
+app.post('/api/auth/logout', authenticate, (req, res) => {
+  const user = users.find((item) => item.id === req.user.id) || req.user;
+  pushApplicationLog({
+    action: 'logout',
+    actor: user.name || user.email,
+    actorRole: user.role,
+    documentId: 'AUTH',
+    department: user.department,
+    status: 'Success',
+    summary: `${user.name || user.email} logged out.`,
+    snapshot: { userId: user.id, employeeCode: user.employeeCode },
+  });
+
+  return res.json({ ok: true });
+});
+
 app.get('/api/auth/me', authenticate, (req, res) => {
   const user = users.find((u) => u.id === req.user.id);
   if (!user) return res.status(404).json({ message: 'User not found' });
@@ -2054,7 +2305,7 @@ app.get('/api/auth/me', authenticate, (req, res) => {
 
 app.get('/api/mrns', authenticate, (req, res) => {
   const user = users.find((item) => item.id === req.user.id) || req.user;
-  return res.json(getVisibleMRNs(user));
+  return res.json(getVisibleMRNs(user).map(decorateMRNForResponse));
 });
 
 app.get('/api/mrns/:id', authenticate, (req, res) => {
@@ -2064,7 +2315,7 @@ app.get('/api/mrns/:id', authenticate, (req, res) => {
   if (!canReadMRS(user, mrn)) {
     return res.status(403).json({ message: 'You are not allowed to access this MRS' });
   }
-  return res.json(mrn);
+  return res.json(decorateMRNForResponse(mrn));
 });
 
 app.get('/api/notifications', authenticate, (req, res) => {
@@ -2139,6 +2390,7 @@ app.post('/api/mrns', authenticate, (req, res) => {
     slaHoursLeft: 96,
     priority: priority || 'Medium',
     purpose: String(purpose || '').trim(),
+    returnRequests: [],
     materials: materials.map((item, index) => ({
       id: `m-${Date.now()}-${index}`,
       materialCode: String(item.materialCode || '').trim(),
@@ -2187,7 +2439,16 @@ app.post('/api/mrns', authenticate, (req, res) => {
     mrn: newMrn,
     summary: `${newMrn.id} created with ${newMrn.materials.length} material line(s).`,
   });
-  return res.status(201).json(newMrn);
+  getL1NotificationTargets(newMrn).forEach((approver) => {
+    pushNotification({
+      userId: approver.id,
+      title: `${newMrn.id} pending L1 approval`,
+      message: `${user.name} submitted an MRS for ${newMrn.department}. ${getAssignedL1ApproverForMRN(newMrn) ? 'This request is assigned to you by Manager Mapping.' : 'This request is routed by department.'}`,
+      type: 'approval',
+      mrnId: newMrn.id,
+    });
+  });
+  return res.status(201).json(decorateMRNForResponse(newMrn));
 });
 
 app.put('/api/mrns/:id', authenticate, (req, res) => {
@@ -2247,7 +2508,7 @@ app.put('/api/mrns/:id', authenticate, (req, res) => {
       mrn,
       summary: `${mrn.id} updated before workflow completion.`,
     });
-    return res.json(mrn);
+    return res.json(decorateMRNForResponse(mrn));
   } catch (error) {
     return res.status(400).json({
       message: error instanceof Error ? error.message : 'Unable to update MRS',
@@ -2288,6 +2549,291 @@ app.delete('/api/mrns/:id', authenticate, (req, res) => {
   return res.json({ id: deletedMrn.id, deleted: true });
 });
 
+app.post('/api/mrns/:id/return-requests', authenticate, (req, res) => {
+  const mrn = mrns.find((item) => item.id === req.params.id);
+  if (!mrn) return res.status(404).json({ message: 'MRS not found' });
+
+  const user = users.find((item) => item.id === req.user.id) || req.user;
+  if (!canReturnMRS(user, mrn)) {
+    return res.status(403).json({ message: 'Only the requester who created this MRS can raise a return request.' });
+  }
+
+  if (!['Issued', 'Partially Issued', 'Partially Returned'].includes(mrn.status)) {
+    return res.status(409).json({ message: `Cannot raise return request when MRS is ${mrn.status}` });
+  }
+
+  const activeRequest = getActiveReturnRequest(mrn);
+  if (activeRequest) {
+    return res.status(409).json({ message: 'A return request is already active for this MRS.' });
+  }
+
+  const reason = String(req.body?.reason || '').trim();
+  if (!reason) {
+    return res.status(400).json({ message: 'Return reason is required' });
+  }
+
+  const materials = Array.isArray(req.body?.materials) ? req.body.materials : [];
+  if (materials.length === 0) {
+    return res.status(400).json({ message: 'Return quantity details are required' });
+  }
+
+  const returnUpdates = new Map(
+    materials.map((item) => [String(item.id || item.materialId), sanitizeQty(item.returnQty ?? item.requestedReturnQty)])
+  );
+
+  const lines = [];
+  let validationError = '';
+
+  mrn.materials.forEach((item) => {
+    const requestedReturnQty = returnUpdates.get(item.id) ?? 0;
+    if (requestedReturnQty <= 0) {
+      return;
+    }
+
+    const issuedQty = getIssuedQty(item);
+    const alreadyReturnedQty = getReturnedQty(item);
+    const maxReturnableQty = Math.max(issuedQty - alreadyReturnedQty, 0);
+
+    if (requestedReturnQty > maxReturnableQty) {
+      validationError = `Return quantity cannot exceed issued quantity for ${item.materialCode}`;
+      return;
+    }
+
+    lines.push(normalizeReturnRequestLine({
+      materialId: item.id,
+      materialCode: item.materialCode,
+      description: item.description,
+      uom: item.uom,
+      issuedQty,
+      alreadyReturnedQty,
+      requestedReturnQty,
+      grnNumber: item.grnNumber,
+    }));
+  });
+
+  if (validationError) {
+    return res.status(400).json({ message: validationError });
+  }
+
+  if (lines.length === 0) {
+    return res.status(400).json({ message: 'At least one material must have a return quantity greater than 0' });
+  }
+
+  const now = new Date().toISOString();
+  const actor = user.name || user.email;
+  const returnRequest = normalizeReturnRequest({
+    id: `rr-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    status: 'Requested',
+    requesterName: actor,
+    requesterRole: user.role,
+    reason,
+    submittedAt: now,
+    lines,
+  });
+
+  mrn.returnRequests = Array.isArray(mrn.returnRequests) ? mrn.returnRequests : [];
+  mrn.returnRequests.unshift(returnRequest);
+  mrn.comments.push({
+    id: `c-${Date.now()}`,
+    author: actor,
+    role: user.role,
+    message: `Return requested: ${reason}`,
+    timestamp: now,
+    avatar: user.name ? buildAvatar(user.name) : '??',
+  });
+  mrn.timeline.push({
+    id: `t-${Date.now()}`,
+    label: 'Return requested',
+    status: 'completed',
+    timestamp: now,
+    actor,
+    note: reason,
+  });
+
+  saveMrns();
+  getReturnHandlerUsers(mrn).forEach((targetUser) => {
+    pushNotification({
+      userId: targetUser.id,
+      title: `${mrn.id} return requested`,
+      message: `${actor} requested return of ${lines.reduce((sum, line) => sum + line.requestedReturnQty, 0)} issued quantity. Reason: ${reason}`,
+      type: 'return',
+      mrnId: mrn.id,
+    });
+  });
+  pushHistoryRecord({
+    action: 'status_change',
+    actor,
+    actorRole: user.role,
+    mrn,
+    summary: `${mrn.id} return request submitted with ${lines.length} material line(s).`,
+  });
+
+  return res.status(201).json(decorateMRNForResponse(mrn));
+});
+
+app.post('/api/mrns/:id/return-requests/:requestId/accept', authenticate, (req, res) => {
+  const mrn = mrns.find((item) => item.id === req.params.id);
+  if (!mrn) return res.status(404).json({ message: 'MRS not found' });
+
+  const user = users.find((item) => item.id === req.user.id) || req.user;
+  if (!canHandleReturnRequest(user, mrn)) {
+    return res.status(403).json({ message: 'Only the assigned issuer can accept this return request.' });
+  }
+
+  const returnRequest = (mrn.returnRequests || []).find((item) => item.id === req.params.requestId);
+  if (!returnRequest) return res.status(404).json({ message: 'Return request not found' });
+  if (returnRequest.status !== 'Requested') {
+    return res.status(409).json({ message: 'Only requested returns can be accepted.' });
+  }
+
+  const now = new Date().toISOString();
+  const actor = user.name || user.email;
+  const note = String(req.body?.note || '').trim();
+  returnRequest.status = 'Accepted';
+  returnRequest.acceptedAt = now;
+  returnRequest.acceptedBy = actor;
+  returnRequest.acceptedNote = note;
+
+  mrn.comments.push({
+    id: `c-${Date.now()}`,
+    author: actor,
+    role: user.role,
+    message: `Return accepted${note ? `: ${note}` : ''}`,
+    timestamp: now,
+    avatar: user.name ? buildAvatar(user.name) : '??',
+  });
+  mrn.timeline.push({
+    id: `t-${Date.now()}`,
+    label: 'Return accepted',
+    status: 'completed',
+    timestamp: now,
+    actor,
+    note: note || 'Issuer accepted the return request.',
+  });
+
+  saveMrns();
+  const requester = getRequesterUser(mrn);
+  if (requester) {
+    pushNotification({
+      userId: requester.id,
+      title: `${mrn.id} return accepted`,
+      message: `${actor} accepted your return request. Please hand over the material physically to complete acknowledgment.`,
+      type: 'return',
+      mrnId: mrn.id,
+    });
+  }
+  pushHistoryRecord({
+    action: 'status_change',
+    actor,
+    actorRole: user.role,
+    mrn,
+    summary: `${mrn.id} return request accepted by issuer.`,
+  });
+
+  return res.json(decorateMRNForResponse(mrn));
+});
+
+app.post('/api/mrns/:id/return-requests/:requestId/receive', authenticate, (req, res) => {
+  const mrn = mrns.find((item) => item.id === req.params.id);
+  if (!mrn) return res.status(404).json({ message: 'MRS not found' });
+
+  const user = users.find((item) => item.id === req.user.id) || req.user;
+  if (!canHandleReturnRequest(user, mrn)) {
+    return res.status(403).json({ message: 'Only the assigned issuer can acknowledge material receipt.' });
+  }
+
+  const returnRequest = (mrn.returnRequests || []).find((item) => item.id === req.params.requestId);
+  if (!returnRequest) return res.status(404).json({ message: 'Return request not found' });
+  if (returnRequest.status !== 'Accepted') {
+    return res.status(409).json({ message: 'Only accepted returns can be marked as received.' });
+  }
+
+  const requestLinesByMaterialId = new Map(returnRequest.lines.map((line) => [line.materialId, line]));
+  let validationError = '';
+
+  mrn.materials = mrn.materials.map((item) => {
+    const requestLine = requestLinesByMaterialId.get(item.id);
+    if (!requestLine) {
+      return item;
+    }
+
+    const requestedQty = getRequestedQty(item);
+    const issuedQty = getIssuedQty(item);
+    const currentReturnedQty = getReturnedQty(item);
+    const returnQty = sanitizeQty(requestLine.requestedReturnQty);
+    const maxReturnableQty = Math.max(issuedQty - currentReturnedQty, 0);
+
+    if (returnQty > maxReturnableQty) {
+      validationError = `Return quantity cannot exceed current outstanding quantity for ${item.materialCode}`;
+      return item;
+    }
+
+    return normalizeMaterial({
+      ...item,
+      requestedQty,
+      issuedQty,
+      returnedQty: currentReturnedQty + returnQty,
+      approvalStatus: 'Approved',
+    });
+  });
+
+  if (validationError) {
+    return res.status(400).json({ message: validationError });
+  }
+
+  const now = new Date().toISOString();
+  const actor = user.name || user.email;
+  const note = String(req.body?.note || '').trim();
+  const previousStatus = mrn.status;
+  returnRequest.status = 'Received';
+  returnRequest.receivedAt = now;
+  returnRequest.receivedBy = actor;
+  returnRequest.receivedNote = note;
+  mrn.status = deriveMRNStatus(mrn);
+  mrn.grnNumber = summarizeGrnNumbers(mrn.materials);
+  mrn.comments.push({
+    id: `c-${Date.now()}`,
+    author: actor,
+    role: user.role,
+    message: `Return acknowledged${note ? `: ${note}` : ''}`,
+    timestamp: now,
+    avatar: user.name ? buildAvatar(user.name) : '??',
+  });
+  mrn.timeline.push({
+    id: `t-${Date.now()}`,
+    label: 'Return acknowledged',
+    status: 'completed',
+    timestamp: now,
+    actor,
+    note: note || 'Issuer physically received and acknowledged returned material.',
+  });
+
+  if (!isClosedMrnStatus(previousStatus) && isClosedMrnStatus(mrn.status)) {
+    notifyClosedMrn({ mrn, actor, action: 'return_acknowledged' });
+  }
+
+  saveMrns();
+  const requester = getRequesterUser(mrn);
+  if (requester) {
+    pushNotification({
+      userId: requester.id,
+      title: `${mrn.id} return acknowledged`,
+      message: `${actor} acknowledged physical receipt of your returned material.`,
+      type: 'return',
+      mrnId: mrn.id,
+    });
+  }
+  pushHistoryRecord({
+    action: 'status_change',
+    actor,
+    actorRole: user.role,
+    mrn,
+    summary: `${mrn.id} returned material physically received and acknowledged.`,
+  });
+
+  return res.json(decorateMRNForResponse(mrn));
+});
+
 app.put('/api/mrns/:id/status', authenticate, (req, res) => {
   const mrn = mrns.find((item) => item.id === req.params.id);
   if (!mrn) return res.status(404).json({ message: 'MRS not found' });
@@ -2303,7 +2849,6 @@ app.put('/api/mrns/:id/status', authenticate, (req, res) => {
     hold: ['L1 Approver', 'L2 Approver', 'Admin'],
     issue: ['Issuer', 'Admin'],
     issuer_hold: ['Issuer', 'Admin'],
-    return: ['Requester', 'L1 Approver', 'L2 Approver', 'Issuer', 'Admin'],
     not_available: ['Issuer', 'Admin'],
   };
 
@@ -2621,7 +3166,7 @@ app.put('/api/mrns/:id/status', authenticate, (req, res) => {
           ? `${mrn.id} return quantities updated.`
           : `${mrn.id} workflow action recorded: ${action.replace('_', ' ')}.`,
   });
-  return res.json(mrn);
+  return res.json(decorateMRNForResponse(mrn));
 });
 
 app.post('/api/mrns/:id/contact-requester', authenticate, authorize(['Issuer', 'Admin']), async (req, res) => {
@@ -2716,13 +3261,13 @@ app.post('/api/mrns/:id/comments', authenticate, (req, res) => {
     mrn,
     summary: `${mrn.id} comment added.`,
   });
-  return res.status(201).json(mrn);
+  return res.status(201).json(decorateMRNForResponse(mrn));
 });
 
 app.get('/api/history', authenticate, (req, res) => {
   const user = users.find((item) => item.id === req.user.id) || req.user;
   if (!(user.role === 'Admin' || user.role === 'Management' || isQmsDepartment(user.department))) {
-    return res.status(403).json({ message: 'History access is restricted to Admin and QMS users' });
+    return res.status(403).json({ message: 'History access is restricted to Admin, Management, and QMS users' });
   }
 
   return res.json(historyRecords);
@@ -2766,6 +3311,111 @@ app.post('/api/pdf/export', authenticate, async (req, res) => {
       message: error instanceof Error ? error.message : 'Unable to generate PDF',
     });
   }
+});
+
+app.get('/api/l1-approver-mappings', authenticate, (req, res) => {
+  const actor = users.find((item) => item.id === req.user.id) || req.user;
+  if (!canManageL1Mappings(actor)) {
+    return res.status(403).json({ message: 'Manager Mapping access is restricted to Admin and Management users' });
+  }
+
+  return res.json({
+    users: users.map(publicUser),
+    l1Approvers: getActiveL1Approvers().map(publicUser),
+    mappings: l1ApproverMappings.map(publicL1ApproverMapping),
+  });
+});
+
+app.put('/api/l1-approver-mappings/:requesterUserId', authenticate, (req, res) => {
+  const actor = users.find((item) => item.id === req.user.id) || req.user;
+  if (!canManageL1Mappings(actor)) {
+    return res.status(403).json({ message: 'Manager Mapping access is restricted to Admin and Management users' });
+  }
+
+  const requesterUserId = String(req.params.requesterUserId || '').trim();
+  const l1ApproverUserId = String(req.body?.l1ApproverUserId || '').trim();
+  const requester = getUserById(requesterUserId);
+  const approver = getUserById(l1ApproverUserId);
+
+  if (!requester) {
+    return res.status(404).json({ message: 'Requester user not found' });
+  }
+
+  if (!approver || approver.role !== 'L1 Approver' || approver.status === 'Inactive') {
+    return res.status(400).json({ message: 'Select an active L1 Approver' });
+  }
+
+  if (requester.id === approver.id) {
+    return res.status(400).json({ message: 'A user cannot be mapped as their own L1 approver' });
+  }
+
+  const now = new Date().toISOString();
+  const existing = getL1MappingForRequester(requesterUserId);
+  if (existing) {
+    existing.l1ApproverUserId = approver.id;
+    existing.updatedAt = now;
+    existing.updatedBy = actor.name || actor.email;
+  } else {
+    l1ApproverMappings.unshift({
+      id: `l1map_${requesterUserId}`,
+      requesterUserId,
+      l1ApproverUserId: approver.id,
+      createdAt: now,
+      updatedAt: now,
+      updatedBy: actor.name || actor.email,
+    });
+  }
+
+  l1ApproverMappings = normalizeL1ApproverMappings(l1ApproverMappings);
+  saveL1ApproverMappings();
+  pushApplicationLog({
+    action: 'mapping',
+    actor: actor.name || actor.email,
+    actorRole: actor.role,
+    documentId: 'L1_MAPPING',
+    department: requester.department,
+    status: 'Connected',
+    summary: `${actor.name || actor.email} connected ${requester.name} to L1 approver ${approver.name}.`,
+    snapshot: {
+      requesterUserId: requester.id,
+      l1ApproverUserId: approver.id,
+    },
+  });
+
+  return res.json({
+    mappings: l1ApproverMappings.map(publicL1ApproverMapping),
+    updated: publicL1ApproverMapping(getL1MappingForRequester(requesterUserId)),
+  });
+});
+
+app.delete('/api/l1-approver-mappings/:requesterUserId', authenticate, (req, res) => {
+  const actor = users.find((item) => item.id === req.user.id) || req.user;
+  if (!canManageL1Mappings(actor)) {
+    return res.status(403).json({ message: 'Manager Mapping access is restricted to Admin and Management users' });
+  }
+
+  const requesterUserId = String(req.params.requesterUserId || '').trim();
+  const existingCount = l1ApproverMappings.length;
+  const requester = getUserById(requesterUserId);
+  l1ApproverMappings = l1ApproverMappings.filter((mapping) => mapping.requesterUserId !== requesterUserId);
+  saveL1ApproverMappings();
+  if (existingCount !== l1ApproverMappings.length) {
+    pushApplicationLog({
+      action: 'mapping',
+      actor: actor.name || actor.email,
+      actorRole: actor.role,
+      documentId: 'L1_MAPPING',
+      department: requester?.department || '',
+      status: 'Cleared',
+      summary: `${actor.name || actor.email} cleared L1 mapping for ${requester?.name || requesterUserId}.`,
+      snapshot: { requesterUserId },
+    });
+  }
+
+  return res.json({
+    removed: existingCount !== l1ApproverMappings.length,
+    mappings: l1ApproverMappings.map(publicL1ApproverMapping),
+  });
 });
 
 app.get('/api/users', authenticate, (req, res) => {
@@ -2824,6 +3474,16 @@ app.post('/api/users', authenticate, async (req, res) => {
 
   users.push(newUser);
   saveUsers();
+  pushApplicationLog({
+    action: 'user_management',
+    actor: user.name || user.email,
+    actorRole: user.role,
+    documentId: newUser.id,
+    department: newUser.department,
+    status: 'Created',
+    summary: `${user.name || user.email} created user ${newUser.name} as ${newUser.role}.`,
+    snapshot: { userId: newUser.id, employeeCode: newUser.employeeCode, role: newUser.role },
+  });
 
   let welcomeEmailDelivery;
   try {
@@ -2891,7 +3551,22 @@ app.put('/api/users/:id', authenticate, (req, res) => {
   if (designation) user.designation = String(designation).trim();
   user.team = departmentRequiresTeam(user.department) ? resolvedTeam : '';
 
+  if (user.role !== 'L1 Approver' || user.status === 'Inactive') {
+    l1ApproverMappings = l1ApproverMappings.filter((mapping) => mapping.l1ApproverUserId !== user.id);
+    saveL1ApproverMappings();
+  }
+
   saveUsers();
+  pushApplicationLog({
+    action: 'user_management',
+    actor: currentActor.name || currentActor.email,
+    actorRole: currentActor.role,
+    documentId: user.id,
+    department: user.department,
+    status: 'Updated',
+    summary: `${currentActor.name || currentActor.email} updated user ${user.name}.`,
+    snapshot: { userId: user.id, employeeCode: user.employeeCode, role: user.role, status: user.status },
+  });
   return res.json(publicUser(user));
 });
 
@@ -2913,7 +3588,21 @@ app.delete('/api/users/:id', authenticate, (req, res) => {
   }
 
   const [removedUser] = users.splice(userIndex, 1);
+  l1ApproverMappings = l1ApproverMappings.filter((mapping) =>
+    mapping.requesterUserId !== removedUser.id && mapping.l1ApproverUserId !== removedUser.id
+  );
   saveUsers();
+  saveL1ApproverMappings();
+  pushApplicationLog({
+    action: 'user_management',
+    actor: currentActor.name || currentActor.email,
+    actorRole: currentActor.role,
+    documentId: removedUser.id,
+    department: removedUser.department,
+    status: 'Deleted',
+    summary: `${currentActor.name || currentActor.email} deleted user ${removedUser.name}.`,
+    snapshot: { userId: removedUser.id, employeeCode: removedUser.employeeCode, role: removedUser.role },
+  });
   return res.json(publicUser(removedUser));
 });
 
@@ -2949,6 +3638,17 @@ app.post('/api/password-reset-requests', (req, res) => {
 
   // create in-app notification for admins
   notifications.push({ id: `n_${Date.now()}`, userId: user ? user.id : null, title: 'Password reset request', body: `Password reset requested for ${normalizedEmail || normalizedCode}`, createdAt: new Date().toISOString(), read: false });
+  saveNotifications();
+  pushApplicationLog({
+    action: 'password_reset',
+    actor: user?.name || normalizedEmail || normalizedCode || 'Unknown',
+    actorRole: user?.role || 'Unauthenticated',
+    documentId: 'PASSWORD_RESET',
+    department: user?.department || '',
+    status: 'Requested',
+    summary: `Password reset requested for ${normalizedEmail || normalizedCode}.`,
+    snapshot: { requestId: id, userId: user?.id || null },
+  });
 
   return res.status(201).json({ message: 'Request submitted', request: record });
 });
@@ -2974,6 +3674,16 @@ app.post('/api/password-reset-requests/:id/approve', authenticate, authorize(['A
 
   // add notification for user (if email present)
   notifications.push({ id: `n_${Date.now() + 1}`, userId: reqRecord.userId, title: 'Password reset approved', body: 'Your password reset was approved. Use the provided link or temporary password to sign in.', createdAt: new Date().toISOString(), read: false });
+  saveNotifications();
+  pushApplicationLog({
+    action: 'password_reset',
+    actor: req.user?.name || req.user?.email || 'Admin',
+    actorRole: req.user?.role || 'Admin',
+    documentId: 'PASSWORD_RESET',
+    status: 'Approved',
+    summary: `Password reset request ${id} approved.`,
+    snapshot: { requestId: id, userId: reqRecord.userId },
+  });
 
   // For development, return the token so it can be used in tests; in production, email it instead
   return res.json({ message: 'Approved', request: reqRecord, token: token });
@@ -2992,6 +3702,16 @@ app.post('/api/password-reset-requests/:id/reject', authenticate, authorize(['Ad
   reqRecord.notes = String(notes || '').trim();
 
   notifications.push({ id: `n_${Date.now() + 2}`, userId: reqRecord.userId, title: 'Password reset rejected', body: `Your password reset request was rejected${reqRecord.notes ? `: ${reqRecord.notes}` : ''}`, createdAt: new Date().toISOString(), read: false });
+  saveNotifications();
+  pushApplicationLog({
+    action: 'password_reset',
+    actor: req.user?.name || req.user?.email || 'Admin',
+    actorRole: req.user?.role || 'Admin',
+    documentId: 'PASSWORD_RESET',
+    status: 'Rejected',
+    summary: `Password reset request ${id} rejected${reqRecord.notes ? `: ${reqRecord.notes}` : ''}.`,
+    snapshot: { requestId: id, userId: reqRecord.userId },
+  });
 
   return res.json({ message: 'Rejected', request: reqRecord });
 });
