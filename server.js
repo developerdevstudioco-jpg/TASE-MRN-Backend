@@ -76,6 +76,32 @@ const PUPPETEER_EXECUTABLE_ENV_KEYS = [
   'CHROME_BIN',
   'BROWSER_EXECUTABLE_PATH',
 ];
+const TREBUCHET_FONT_PATHS = {
+  regular: [
+    process.env.TREBUCHET_MS_REGULAR_PATH,
+    'C:\\Windows\\Fonts\\trebuc.ttf',
+    '/usr/share/fonts/truetype/msttcorefonts/trebuc.ttf',
+    '/usr/share/fonts/truetype/msttcorefonts/Trebuchet_MS.ttf',
+  ],
+  bold: [
+    process.env.TREBUCHET_MS_BOLD_PATH,
+    'C:\\Windows\\Fonts\\trebucbd.ttf',
+    '/usr/share/fonts/truetype/msttcorefonts/trebucbd.ttf',
+    '/usr/share/fonts/truetype/msttcorefonts/Trebuchet_MS_Bold.ttf',
+  ],
+  italic: [
+    process.env.TREBUCHET_MS_ITALIC_PATH,
+    'C:\\Windows\\Fonts\\trebucit.ttf',
+    '/usr/share/fonts/truetype/msttcorefonts/trebucit.ttf',
+    '/usr/share/fonts/truetype/msttcorefonts/Trebuchet_MS_Italic.ttf',
+  ],
+  boldItalic: [
+    process.env.TREBUCHET_MS_BOLD_ITALIC_PATH,
+    'C:\\Windows\\Fonts\\trebucbi.ttf',
+    '/usr/share/fonts/truetype/msttcorefonts/trebucbi.ttf',
+    '/usr/share/fonts/truetype/msttcorefonts/Trebuchet_MS_Bold_Italic.ttf',
+  ],
+};
 let mailTransporter = null;
 let mailTransporterName = 'console';
 let mailTransporterMode = 'console';
@@ -881,6 +907,114 @@ const buildBrowserLaunchOptions = () => {
   };
 };
 
+const findExistingFontPath = (candidates = []) =>
+  candidates
+    .filter(Boolean)
+    .map((candidate) => path.normalize(String(candidate).trim()))
+    .find((candidate) => {
+      try {
+        return fs.existsSync(candidate);
+      } catch {
+        return false;
+      }
+    }) || '';
+
+const getFontFormat = (fontPath) => {
+  const extension = path.extname(fontPath).toLowerCase();
+  if (extension === '.otf') return 'opentype';
+  if (extension === '.woff') return 'woff';
+  if (extension === '.woff2') return 'woff2';
+  return 'truetype';
+};
+
+const getFontMimeType = (fontPath) => {
+  const extension = path.extname(fontPath).toLowerCase();
+  if (extension === '.otf') return 'font/otf';
+  if (extension === '.woff') return 'font/woff';
+  if (extension === '.woff2') return 'font/woff2';
+  return 'font/ttf';
+};
+
+const buildTrebuchetFontFaceRule = ({ paths, weights, style = 'normal' }) => {
+  const fontPath = findExistingFontPath(paths);
+  if (!fontPath) {
+    return '';
+  }
+
+  const fontData = fs.readFileSync(fontPath).toString('base64');
+  const source = `url("data:${getFontMimeType(fontPath)};base64,${fontData}") format("${getFontFormat(fontPath)}")`;
+
+  return weights
+    .map((weight) => `
+      @font-face {
+        font-family: "Trebuchet MS";
+        src: ${source};
+        font-weight: ${weight};
+        font-style: ${style};
+        font-display: block;
+      }
+    `)
+    .join('\n');
+};
+
+const buildTrebuchetFontFaceCss = () => {
+  try {
+    const css = [
+      buildTrebuchetFontFaceRule({ paths: TREBUCHET_FONT_PATHS.regular, weights: [400] }),
+      buildTrebuchetFontFaceRule({ paths: TREBUCHET_FONT_PATHS.bold, weights: [700] }),
+      buildTrebuchetFontFaceRule({ paths: TREBUCHET_FONT_PATHS.italic, weights: [400], style: 'italic' }),
+      buildTrebuchetFontFaceRule({ paths: TREBUCHET_FONT_PATHS.boldItalic, weights: [700], style: 'italic' }),
+    ].filter(Boolean).join('\n');
+
+    if (!css) {
+      console.warn('[pdf] Trebuchet MS font files were not found. PDF export will request Trebuchet MS, but Chromium may fall back if the font is not installed on the server.');
+    }
+
+    return css;
+  } catch (error) {
+    console.warn('[pdf] Failed to prepare Trebuchet MS font embedding.', summarizeError(error));
+    return '';
+  }
+};
+
+const TREBUCHET_FONT_FACE_CSS = buildTrebuchetFontFaceCss();
+let pdfBrowserPromise = null;
+
+const launchPdfBrowser = async () => {
+  const launchOptions = buildBrowserLaunchOptions();
+
+  try {
+    console.info('[pdf] Launching reusable browser for PDF export.', {
+      library: 'puppeteer',
+      executablePath: launchOptions.executablePath || 'puppeteer-managed',
+      cacheDir: process.env.PUPPETEER_CACHE_DIR || 'default',
+      platform: process.platform,
+    });
+    const browser = await puppeteer.launch(launchOptions);
+    browser.on('disconnected', () => {
+      pdfBrowserPromise = null;
+    });
+    return browser;
+  } catch (error) {
+    console.error('[pdf] Browser launch failed.', summarizeError(error));
+    throw new Error(
+      `PDF browser launch failed: ${error?.message || error}. ` +
+      'On Render, use backend build command "npm ci" so the Puppeteer postinstall script downloads Chrome, and do not set PUPPETEER_EXECUTABLE_PATH to a local machine path.'
+    );
+  }
+};
+
+const getPdfBrowser = async () => {
+  if (!pdfBrowserPromise) {
+    pdfBrowserPromise = launchPdfBrowser().catch((error) => {
+      pdfBrowserPromise = null;
+      throw error;
+    });
+  }
+
+  return pdfBrowserPromise;
+};
+
 const buildPdfHtmlDocument = ({ content, styles = '', title = 'Document', baseUrl = '' }) => `<!doctype html>
 <html lang="en">
   <head>
@@ -888,11 +1022,13 @@ const buildPdfHtmlDocument = ({ content, styles = '', title = 'Document', baseUr
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>${escapeHtml(title)}</title>
     ${baseUrl ? `<base href="${escapeHtml(baseUrl)}" />` : ''}
+    ${TREBUCHET_FONT_FACE_CSS ? `<style>${TREBUCHET_FONT_FACE_CSS}</style>` : ''}
     <style>
       html, body {
         margin: 0;
         padding: 0;
         background: #ffffff;
+        font-family: "Trebuchet MS", Trebuchet, Arial, sans-serif;
         color-adjust: exact;
         -webkit-print-color-adjust: exact;
         print-color-adjust: exact;
@@ -900,6 +1036,11 @@ const buildPdfHtmlDocument = ({ content, styles = '', title = 'Document', baseUr
 
       body {
         min-height: 100%;
+        font-family: "Trebuchet MS", Trebuchet, Arial, sans-serif;
+      }
+
+      *, *::before, *::after {
+        font-family: "Trebuchet MS", Trebuchet, Arial, sans-serif !important;
       }
 
       /* PDF print helpers: keep table headers, allow row breaks, and ensure images scale */
@@ -926,6 +1067,21 @@ const buildPdfHtmlDocument = ({ content, styles = '', title = 'Document', baseUr
       tr { page-break-inside: avoid; page-break-after: auto; }
 
       img { max-width: 100%; height: auto; display: block; }
+      .mrn-document-logo {
+        flex: 0 0 38mm !important;
+        width: 38mm !important;
+        max-width: 38mm !important;
+        height: 18mm !important;
+        max-height: 18mm !important;
+        overflow: visible !important;
+      }
+      .mrn-document-logo img {
+        width: auto !important;
+        max-width: 38mm !important;
+        height: 18mm !important;
+        max-height: 18mm !important;
+        object-fit: contain !important;
+      }
       td, th { word-break: break-word; }
 
       @media print {
@@ -933,6 +1089,13 @@ const buildPdfHtmlDocument = ({ content, styles = '', title = 'Document', baseUr
       }
     </style>
     <style>${styles}</style>
+    <style>
+      html,
+      body,
+      body * {
+        font-family: "Trebuchet MS", Trebuchet, Arial, sans-serif !important;
+      }
+    </style>
   </head>
   <body>
     ${content}
@@ -948,27 +1111,13 @@ const generatePdfBuffer = async ({
   margin = 5,
   baseUrl = '',
 }) => {
-  const launchOptions = buildBrowserLaunchOptions();
-  let browser;
+  let page;
 
   try {
-    console.info('[pdf] Launching browser for PDF export.', {
-      library: 'puppeteer',
-      executablePath: launchOptions.executablePath || 'puppeteer-managed',
-      cacheDir: process.env.PUPPETEER_CACHE_DIR || 'default',
-      platform: process.platform,
-    });
-    browser = await puppeteer.launch(launchOptions);
-  } catch (error) {
-    console.error('[pdf] Browser launch failed.', summarizeError(error));
-    throw new Error(
-      `PDF browser launch failed: ${error?.message || error}. ` +
-      'On Render, use backend build command "npm ci" so the Puppeteer postinstall script downloads Chrome, and do not set PUPPETEER_EXECUTABLE_PATH to a local machine path.'
-    );
-  }
-
-  try {
-    const page = await browser.newPage();
+    const browser = await getPdfBrowser();
+    page = await browser.newPage();
+    page.setDefaultTimeout(15000);
+    page.setDefaultNavigationTimeout(15000);
     page.on('pageerror', (error) => {
       console.warn('[pdf] Page script error during PDF render.', summarizeError(error));
     });
@@ -988,13 +1137,16 @@ const generatePdfBuffer = async ({
         title,
         baseUrl,
       }),
-      { waitUntil: 'networkidle0' }
+      { waitUntil: 'domcontentloaded', timeout: 15000 }
     );
     await page.emulateMediaType('screen');
     await page.evaluate(async () => {
-      await new Promise((resolve) => {
-        requestAnimationFrame(() => requestAnimationFrame(resolve));
-      });
+      await new Promise((resolve) => requestAnimationFrame(resolve));
+      const waitWithTimeout = (promise, timeoutMs) =>
+        Promise.race([
+          promise,
+          new Promise((resolve) => setTimeout(resolve, timeoutMs)),
+        ]);
 
       const imageLoadPromises = Array.from(document.images)
         .filter((img) => !img.complete)
@@ -1004,11 +1156,17 @@ const generatePdfBuffer = async ({
               img.onload = img.onerror = resolve;
             })
         );
+      const fontLoadPromises = document.fonts
+        ? [
+            document.fonts.load('400 12px "Trebuchet MS"'),
+            document.fonts.load('700 12px "Trebuchet MS"'),
+            document.fonts.ready,
+          ]
+        : [];
 
       await Promise.all([
-        ...imageLoadPromises,
-        document.fonts?.ready || Promise.resolve(),
-        new Promise((resolve) => setTimeout(resolve, 1500)),
+        waitWithTimeout(Promise.all(imageLoadPromises), 1500),
+        waitWithTimeout(Promise.all(fontLoadPromises), 1500),
       ]);
     });
 
@@ -1023,16 +1181,17 @@ const generatePdfBuffer = async ({
         bottom: `${margin}mm`,
         left: `${margin}mm`,
       },
+      waitForFonts: true,
     });
   } catch (error) {
     console.error('[pdf] PDF rendering failed.', summarizeError(error));
     throw new Error(`PDF rendering failed: ${error?.message || error}`);
   } finally {
-    if (browser) {
+    if (page) {
       try {
-        await browser.close();
+        await page.close();
       } catch (error) {
-        console.warn('[pdf] Browser close failed after PDF export.', summarizeError(error));
+        console.warn('[pdf] Page close failed after PDF export.', summarizeError(error));
       }
     }
   }
@@ -1578,7 +1737,27 @@ const buildMrnMaterials = (materials = [], existingMaterials = []) => {
 const saveUsers = () => saveCollection('users', users);
 const saveMrns = () => saveCollection('mrns', mrns);
 const saveNotifications = () => saveCollection('notifications', notifications);
-const saveHistoryRecords = () => saveCollection('historyRecords', historyRecords);
+const getCurrentMonthLogCutoff = (now = new Date()) =>
+  new Date(now.getFullYear(), now.getMonth(), 1, 0, 0, 0, 0);
+
+const pruneHistoryRecordsForCurrentMonth = (now = new Date()) => {
+  const cutoff = getCurrentMonthLogCutoff(now);
+  const initialCount = Array.isArray(historyRecords) ? historyRecords.length : 0;
+
+  historyRecords = Array.isArray(historyRecords)
+    ? historyRecords.filter((record) => {
+        const timestamp = new Date(record?.timestamp || 0);
+        return !Number.isNaN(timestamp.getTime()) && timestamp >= cutoff;
+      })
+    : [];
+
+  return initialCount - historyRecords.length;
+};
+
+const saveHistoryRecords = () => {
+  pruneHistoryRecordsForCurrentMonth();
+  return saveCollection('historyRecords', historyRecords);
+};
 const saveL1ApproverMappings = () => saveCollection('l1ApproverMappings', l1ApproverMappings);
 
 const ensureBootstrapAdmins = () => {
@@ -1817,6 +1996,10 @@ const hydrateStateFromDatabase = async () => {
         summary: String(record.summary || '').replace(record.documentId, normalizedMrnPayload.legacyIdMap.get(record.documentId) || record.documentId),
       }))
     : structuredClone(seededHistoryRecords);
+  const prunedHistoryCount = pruneHistoryRecordsForCurrentMonth();
+  if (prunedHistoryCount > 0) {
+    console.log(`[logs] Pruned ${prunedHistoryCount} log monitor entr${prunedHistoryCount === 1 ? 'y' : 'ies'} from previous month(s).`);
+  }
 
   ensureBootstrapAdmins();
   await Promise.all([
@@ -3268,6 +3451,11 @@ app.get('/api/history', authenticate, (req, res) => {
   const user = users.find((item) => item.id === req.user.id) || req.user;
   if (!(user.role === 'Admin' || user.role === 'Management' || isQmsDepartment(user.department))) {
     return res.status(403).json({ message: 'History access is restricted to Admin, Management, and QMS users' });
+  }
+
+  const prunedHistoryCount = pruneHistoryRecordsForCurrentMonth();
+  if (prunedHistoryCount > 0) {
+    saveHistoryRecords();
   }
 
   return res.json(historyRecords);
