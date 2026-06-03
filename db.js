@@ -1,8 +1,6 @@
 import dotenv from 'dotenv';
-import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { DatabaseSync } from 'node:sqlite';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 dotenv.config({ path: path.join(__dirname, '.env') });
@@ -13,8 +11,12 @@ const resolvedDbPath = configuredDbPath
   ? (path.isAbsolute(configuredDbPath) ? configuredDbPath : path.resolve(__dirname, configuredDbPath))
   : DEFAULT_DB_PATH;
 
-const configuredDriver = String(process.env.MRN_DB_DRIVER || 'sqlite').trim().toLowerCase();
-const activeDriver = configuredDriver === 'postgres' ? 'postgres' : 'sqlite';
+const configuredDriver = String(process.env.MRN_DB_DRIVER || 'postgres').trim().toLowerCase();
+const activeDriver = ['postgres', 'postgresql', 'pg'].includes(configuredDriver)
+  ? 'postgres'
+  : configuredDriver === 'sqlite'
+    ? 'sqlite'
+    : 'postgres';
 
 let database = null; // sqlite DatabaseSync instance
 let statements = null;
@@ -42,10 +44,13 @@ const initializeStatements = (db) => ({
   `),
 });
 
-const initializeSqlite = () => {
+const initializeSqlite = async () => {
   if (database) {
     return database;
   }
+
+  const fs = await requireNodeFs();
+  const DatabaseSync = await requireNodeSqlite();
 
   fs.mkdirSync(path.dirname(resolvedDbPath), { recursive: true });
 
@@ -69,6 +74,13 @@ const initializeSqlite = () => {
   return database;
 };
 
+const requireNodeFs = async () => import('node:fs');
+
+const requireNodeSqlite = async () => {
+  const sqliteModule = await import('node:sqlite');
+  return sqliteModule.DatabaseSync;
+};
+
 const initializePostgres = async () => {
   if (pgPool) return pgPool;
 
@@ -77,13 +89,14 @@ const initializePostgres = async () => {
   ).trim();
 
   if (!connectionString) {
-    throw new Error('MRN_DATABASE_URL (or DATABASE_URL) must be set for Postgres driver');
+    throw new Error('MRN_DATABASE_URL or DATABASE_URL must be set for PostgreSQL storage');
   }
 
   const { Pool } = await import('pg');
 
-  // Neon requires SSL; allow NODE env to override if needed
-  const ssl = process.env.PGDONTVERIFY === 'true' ? false : { rejectUnauthorized: false };
+  const sslMode = String(process.env.PGSSLMODE || '').trim().toLowerCase();
+  const sslDisabled = sslMode === 'disable' || process.env.PGDONTVERIFY === 'true';
+  const ssl = sslDisabled ? false : { rejectUnauthorized: false };
 
   pgPool = new Pool({ connectionString, ssl });
 
@@ -126,8 +139,8 @@ const deserializePayload = (key, payload) => {
   }
 };
 
-const saveToSqlite = (key, value) => {
-  const db = initializeSqlite();
+const saveToSqlite = async (key, value) => {
+  const db = await initializeSqlite();
   statements ??= initializeStatements(db);
   statements.upsertState.run(key, serializePayload(value));
 };
@@ -189,7 +202,7 @@ export const loadCollection = async (key, fallbackValue) => {
   }
 
   // sqlite path
-  ensureDatabase();
+  await ensureDatabase();
 
   try {
     const row = statements.selectState.get(key);
@@ -223,7 +236,7 @@ export const saveCollection = (key, value) =>
       return;
     }
 
-    saveToSqlite(key, value);
+    await saveToSqlite(key, value);
   });
 
 export const saveCollectionStrict = async (key, value) => {
@@ -232,7 +245,7 @@ export const saveCollectionStrict = async (key, value) => {
     return;
   }
 
-  saveToSqlite(key, value);
+  await saveToSqlite(key, value);
 };
 
 export const closeDatabase = async () => {

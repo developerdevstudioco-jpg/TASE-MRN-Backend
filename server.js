@@ -79,29 +79,40 @@ const PUPPETEER_EXECUTABLE_ENV_KEYS = [
 const TREBUCHET_FONT_PATHS = {
   regular: [
     process.env.TREBUCHET_MS_REGULAR_PATH,
+    path.resolve(__dirname, 'assets', 'fonts', 'trebuc.ttf'),
+    path.resolve(__dirname, 'assets', 'fonts', 'Trebuchet_MS.ttf'),
     'C:\\Windows\\Fonts\\trebuc.ttf',
     '/usr/share/fonts/truetype/msttcorefonts/trebuc.ttf',
     '/usr/share/fonts/truetype/msttcorefonts/Trebuchet_MS.ttf',
   ],
   bold: [
     process.env.TREBUCHET_MS_BOLD_PATH,
+    path.resolve(__dirname, 'assets', 'fonts', 'trebucbd.ttf'),
+    path.resolve(__dirname, 'assets', 'fonts', 'Trebuchet_MS_Bold.ttf'),
     'C:\\Windows\\Fonts\\trebucbd.ttf',
     '/usr/share/fonts/truetype/msttcorefonts/trebucbd.ttf',
     '/usr/share/fonts/truetype/msttcorefonts/Trebuchet_MS_Bold.ttf',
   ],
   italic: [
     process.env.TREBUCHET_MS_ITALIC_PATH,
+    path.resolve(__dirname, 'assets', 'fonts', 'trebucit.ttf'),
+    path.resolve(__dirname, 'assets', 'fonts', 'Trebuchet_MS_Italic.ttf'),
     'C:\\Windows\\Fonts\\trebucit.ttf',
     '/usr/share/fonts/truetype/msttcorefonts/trebucit.ttf',
     '/usr/share/fonts/truetype/msttcorefonts/Trebuchet_MS_Italic.ttf',
   ],
   boldItalic: [
     process.env.TREBUCHET_MS_BOLD_ITALIC_PATH,
+    path.resolve(__dirname, 'assets', 'fonts', 'trebucbi.ttf'),
+    path.resolve(__dirname, 'assets', 'fonts', 'Trebuchet_MS_Bold_Italic.ttf'),
     'C:\\Windows\\Fonts\\trebucbi.ttf',
     '/usr/share/fonts/truetype/msttcorefonts/trebucbi.ttf',
     '/usr/share/fonts/truetype/msttcorefonts/Trebuchet_MS_Bold_Italic.ttf',
   ],
 };
+const PDF_FONT_FAMILY = 'TASE PDF Trebuchet MS';
+const PDF_FONT_STACK = `"${PDF_FONT_FAMILY}", "Trebuchet MS", Arial, sans-serif`;
+const REQUIRE_TREBUCHET_MS_FOR_PDF = process.env.PDF_REQUIRE_TREBUCHET_MS !== 'false';
 let mailTransporter = null;
 let mailTransporterName = 'console';
 let mailTransporterMode = 'console';
@@ -454,6 +465,9 @@ app.get('/readyz', (req, res) => {
     environment: NODE_ENV,
     mail: getMailDiagnostics(),
     database: getDatabaseDriver(),
+    pdf: {
+      font: getPdfFontDiagnostics(),
+    },
   });
 });
 
@@ -919,6 +933,26 @@ const findExistingFontPath = (candidates = []) =>
       }
     }) || '';
 
+const TREBUCHET_FONT_STATUS = {
+  regular: findExistingFontPath(TREBUCHET_FONT_PATHS.regular),
+  bold: findExistingFontPath(TREBUCHET_FONT_PATHS.bold),
+  italic: findExistingFontPath(TREBUCHET_FONT_PATHS.italic),
+  boldItalic: findExistingFontPath(TREBUCHET_FONT_PATHS.boldItalic),
+};
+
+const getPdfFontDiagnostics = () => ({
+  requiredFamily: 'Trebuchet MS',
+  embeddedFamily: PDF_FONT_FAMILY,
+  embedded: Boolean(TREBUCHET_FONT_STATUS.regular),
+  strict: REQUIRE_TREBUCHET_MS_FOR_PDF,
+  faces: {
+    regular: Boolean(TREBUCHET_FONT_STATUS.regular),
+    bold: Boolean(TREBUCHET_FONT_STATUS.bold),
+    italic: Boolean(TREBUCHET_FONT_STATUS.italic),
+    boldItalic: Boolean(TREBUCHET_FONT_STATUS.boldItalic),
+  },
+});
+
 const getFontFormat = (fontPath) => {
   const extension = path.extname(fontPath).toLowerCase();
   if (extension === '.otf') return 'opentype';
@@ -935,8 +969,7 @@ const getFontMimeType = (fontPath) => {
   return 'font/ttf';
 };
 
-const buildTrebuchetFontFaceRule = ({ paths, weights, style = 'normal' }) => {
-  const fontPath = findExistingFontPath(paths);
+const buildTrebuchetFontFaceRule = ({ fontPath, weights, style = 'normal' }) => {
   if (!fontPath) {
     return '';
   }
@@ -947,7 +980,7 @@ const buildTrebuchetFontFaceRule = ({ paths, weights, style = 'normal' }) => {
   return weights
     .map((weight) => `
       @font-face {
-        font-family: "Trebuchet MS";
+        font-family: "${PDF_FONT_FAMILY}";
         src: ${source};
         font-weight: ${weight};
         font-style: ${style};
@@ -959,16 +992,26 @@ const buildTrebuchetFontFaceRule = ({ paths, weights, style = 'normal' }) => {
 
 const buildTrebuchetFontFaceCss = () => {
   try {
-    const css = [
-      buildTrebuchetFontFaceRule({ paths: TREBUCHET_FONT_PATHS.regular, weights: [400] }),
-      buildTrebuchetFontFaceRule({ paths: TREBUCHET_FONT_PATHS.bold, weights: [700] }),
-      buildTrebuchetFontFaceRule({ paths: TREBUCHET_FONT_PATHS.italic, weights: [400], style: 'italic' }),
-      buildTrebuchetFontFaceRule({ paths: TREBUCHET_FONT_PATHS.boldItalic, weights: [700], style: 'italic' }),
-    ].filter(Boolean).join('\n');
-
-    if (!css) {
-      console.warn('[pdf] Trebuchet MS font files were not found. PDF export will request Trebuchet MS, but Chromium may fall back if the font is not installed on the server.');
+    const regularPath = TREBUCHET_FONT_STATUS.regular;
+    if (!regularPath) {
+      console.warn('[pdf] Trebuchet MS regular font file was not found. PDF export cannot guarantee Trebuchet MS.');
+      return '';
     }
+
+    const css = [
+      buildTrebuchetFontFaceRule({ fontPath: regularPath, weights: [400, 500, 600] }),
+      buildTrebuchetFontFaceRule({ fontPath: TREBUCHET_FONT_STATUS.bold || regularPath, weights: [700, 800] }),
+      buildTrebuchetFontFaceRule({
+        fontPath: TREBUCHET_FONT_STATUS.italic,
+        weights: [400, 500, 600],
+        style: 'italic',
+      }),
+      buildTrebuchetFontFaceRule({
+        fontPath: TREBUCHET_FONT_STATUS.boldItalic || TREBUCHET_FONT_STATUS.italic,
+        weights: [700, 800],
+        style: 'italic',
+      }),
+    ].filter(Boolean).join('\n');
 
     return css;
   } catch (error) {
@@ -978,6 +1021,18 @@ const buildTrebuchetFontFaceCss = () => {
 };
 
 const TREBUCHET_FONT_FACE_CSS = buildTrebuchetFontFaceCss();
+
+const assertTrebuchetFontReadyForPdf = () => {
+  if (!REQUIRE_TREBUCHET_MS_FOR_PDF || TREBUCHET_FONT_STATUS.regular) {
+    return;
+  }
+
+  throw new Error(
+    'Trebuchet MS font file is missing on the backend PDF server. ' +
+    'Copy Trebuchet MS font files into backend/assets/fonts or set TREBUCHET_MS_REGULAR_PATH before exporting.'
+  );
+};
+
 let pdfBrowserPromise = null;
 
 const launchPdfBrowser = async () => {
@@ -1028,7 +1083,7 @@ const buildPdfHtmlDocument = ({ content, styles = '', title = 'Document', baseUr
         margin: 0;
         padding: 0;
         background: #ffffff;
-        font-family: "Trebuchet MS", Trebuchet, Arial, sans-serif;
+        font-family: ${PDF_FONT_STACK};
         color-adjust: exact;
         -webkit-print-color-adjust: exact;
         print-color-adjust: exact;
@@ -1036,11 +1091,11 @@ const buildPdfHtmlDocument = ({ content, styles = '', title = 'Document', baseUr
 
       body {
         min-height: 100%;
-        font-family: "Trebuchet MS", Trebuchet, Arial, sans-serif;
+        font-family: ${PDF_FONT_STACK};
       }
 
       *, *::before, *::after {
-        font-family: "Trebuchet MS", Trebuchet, Arial, sans-serif !important;
+        font-family: ${PDF_FONT_STACK} !important;
       }
 
       /* PDF print helpers: keep table headers, allow row breaks, and ensure images scale */
@@ -1093,7 +1148,7 @@ const buildPdfHtmlDocument = ({ content, styles = '', title = 'Document', baseUr
       html,
       body,
       body * {
-        font-family: "Trebuchet MS", Trebuchet, Arial, sans-serif !important;
+        font-family: ${PDF_FONT_STACK} !important;
       }
     </style>
   </head>
@@ -1114,6 +1169,8 @@ const generatePdfBuffer = async ({
   let page;
 
   try {
+    assertTrebuchetFontReadyForPdf();
+
     const browser = await getPdfBrowser();
     page = await browser.newPage();
     page.setDefaultTimeout(15000);
@@ -1140,7 +1197,7 @@ const generatePdfBuffer = async ({
       { waitUntil: 'domcontentloaded', timeout: 15000 }
     );
     await page.emulateMediaType('screen');
-    await page.evaluate(async () => {
+    await page.evaluate(async (pdfFontFamily) => {
       await new Promise((resolve) => requestAnimationFrame(resolve));
       const waitWithTimeout = (promise, timeoutMs) =>
         Promise.race([
@@ -1158,8 +1215,8 @@ const generatePdfBuffer = async ({
         );
       const fontLoadPromises = document.fonts
         ? [
-            document.fonts.load('400 12px "Trebuchet MS"'),
-            document.fonts.load('700 12px "Trebuchet MS"'),
+            document.fonts.load(`400 12px "${pdfFontFamily}"`),
+            document.fonts.load(`700 12px "${pdfFontFamily}"`),
             document.fonts.ready,
           ]
         : [];
@@ -1168,7 +1225,7 @@ const generatePdfBuffer = async ({
         waitWithTimeout(Promise.all(imageLoadPromises), 1500),
         waitWithTimeout(Promise.all(fontLoadPromises), 1500),
       ]);
-    });
+    }, PDF_FONT_FAMILY);
 
     return await page.pdf({
       format: pageFormat.toUpperCase(),
@@ -3933,7 +3990,7 @@ const startServer = async () => {
   try {
     console.log('\n🚀 Starting MRS Backend Server...\n');
     
-    console.log('📡 Initializing SQLite database...');
+    console.log(`📡 Initializing ${getDatabaseDriver() === 'postgres' ? 'PostgreSQL' : 'SQLite'} database...`);
     await initializeDatabase();
     console.log('✅ Database connection successful\n');
 
@@ -3986,7 +4043,7 @@ const startServer = async () => {
     process.exit(1);
   } catch (error) {
     console.error('\n❌ Failed to start server:', error.message);
-    console.error('\n📋 Server startup failed. Verify backend/.env and ensure MRN_DB_PATH points to a writable SQLite file.\n');
+    console.error('\n📋 Server startup failed. Verify backend/.env and ensure MRN_DATABASE_URL or DATABASE_URL points to a reachable PostgreSQL database.\n');
 
     process.exit(1);
   }

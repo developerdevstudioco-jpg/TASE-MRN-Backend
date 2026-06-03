@@ -1,6 +1,6 @@
 # TASE Digital MRN Backend
 
-This backend provides the Express API for the MRN frontend and persists app data in a local SQLite database.
+This backend provides the Express API for the MRN frontend and persists app data in PostgreSQL.
 
 ## Setup
 
@@ -24,7 +24,10 @@ This backend provides the Express API for the MRN frontend and persists app data
 - `NODE_ENV`
 - `PORT`
 - `JWT_SECRET`
-- `MRN_DB_PATH`
+- `MRN_DB_DRIVER`
+- `MRN_DATABASE_URL`
+- `DATABASE_URL`
+- `PGSSLMODE`
 - `DEBUG_DB`
 - `EMAIL_LOGO_URL`
 - `EMAIL_LOGO_PATH`
@@ -51,9 +54,11 @@ This backend provides the Express API for the MRN frontend and persists app data
 
 ## Notes
 
-- Relative `MRN_DB_PATH` values are resolved from the `backend/` directory.
-- The default local database file is `backend/data/mrn.sqlite`.
+- PostgreSQL is the default database driver.
+- Set `MRN_DATABASE_URL` to the PostgreSQL connection string. `DATABASE_URL` is also supported for hosting providers that inject it automatically.
+- Set `PGSSLMODE=disable` only for local PostgreSQL servers that do not use SSL. Hosted PostgreSQL providers usually require SSL.
+- The legacy SQLite fallback is available only when `MRN_DB_DRIVER=sqlite`; relative `MRN_DB_PATH` values are resolved from the `backend/` directory.
 - The backend keeps a production-safe logo copy at `backend/assets/logo.png`.
-- App state is stored in the SQLite `app_state` table as JSON payloads keyed by collection name.
+- App state is stored in the PostgreSQL `app_state` table as JSON payloads keyed by collection name.
 - For production email branding, set `EMAIL_LOGO_URL` to a public HTTPS image URL if you do not want the backend to serve the logo itself.
 - PDF export auto-detects installed browsers such as Chrome, Brave, Chromium, and Edge across common Windows, macOS, and Linux locations.
